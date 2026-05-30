@@ -7,11 +7,7 @@ from dataclasses import dataclass
 from openrouter import components, utils
 
 import src.adapters.open_router as open_router_module
-from src.harness.config import (
-    DEFAULT_HARNESS_CONFIG_PATH,
-    HarnessConfig,
-    OpenRouterConfig,
-)
+from src.harness.config import OpenRouterConfig
 
 
 @dataclass
@@ -329,7 +325,7 @@ def test_openrouter_complete_allows_explicit_extra_body_tool_choice(monkeypatch)
     assert captured_kwargs["tool_choice"] == "required"
 
 
-def test_default_harness_config_builds_valid_openrouter_sdk_request(monkeypatch):
+def test_openrouter_config_builds_valid_sdk_request(monkeypatch):
     from src.harness import core
 
     captured_kwargs: dict[str, object] = {}
@@ -375,11 +371,22 @@ def test_default_harness_config_builds_valid_openrouter_sdk_request(monkeypatch)
             self.chat = _FakeChat()
 
     monkeypatch.setattr(open_router_module, "OpenRouterClient", _FakeOpenRouterClient)
-    harness_config = HarnessConfig.model_validate_json(
-        DEFAULT_HARNESS_CONFIG_PATH.read_text()
-    )
     llm = open_router_module.OpenRouter(
-        config=harness_config.llm_provider_config,
+        config=OpenRouterConfig(
+            model_name="deepseek/deepseek-v4-flash",
+            max_output_tokens=16384,
+            reasoning_effort="low",
+            timeout_seconds=300.0,
+            base_url="https://openrouter.ai/api/v1",
+            provider_kwargs={
+                "require_parameters": True,
+                "provider": {
+                    "order": ["gmicloud"],
+                    "allow_fallbacks": True,
+                    "ignore": ["siliconflow", "parasail", "morph", "venice"],
+                },
+            },
+        ),
         api_key="test-key",
     )
 

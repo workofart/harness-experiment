@@ -30,10 +30,21 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
     assert config.llm_provider_config.service_tier is None
 
 
-def test_default_harness_config_accepts_provider_require_parameters():
+def test_default_harness_config_matches_baseline_run_profile():
     config = HarnessConfig.model_validate_json(DEFAULT_HARNESS_CONFIG_PATH.read_text())
 
-    assert config.llm_provider_config.provider_kwargs.require_parameters is True
+    assert len(config.train_task_names) == 69
+    assert len(config.slow_task_names) == 20
+    # slow tasks are held out of the panel, never overlapping it
+    assert set(config.train_task_names).isdisjoint(config.slow_task_names)
+    assert len(set(config.train_task_names) | set(config.slow_task_names)) == 89
+    assert config.max_trial_concurrency == 16
+    assert config.max_env_concurrency == 10
+    assert config.task_trials == 5
+    assert config.llm_provider_config.provider == "chatgpt_codex"
+    assert config.llm_provider_config.model_name == "gpt-5.5"
+    assert config.llm_provider_config.max_context_length == 200000
+    assert config.llm_provider_config.reasoning_effort == "high"
 
 
 def test_harness_config_accepts_provider_require_parameters():

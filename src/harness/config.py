@@ -129,6 +129,14 @@ class HarnessConfig(BaseModel):
         min_length=1,
         description="Task ids used for the train panel.",
     )
+    slow_task_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Task ids held out of the train panel because they consistently "
+            "exhaust task_timeout_sec. Storage only: these are not run. Kept in "
+            "the same relative order as train_task_names."
+        ),
+    )
     max_steps: int = Field(
         default=50,
         gt=0,
