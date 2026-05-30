@@ -363,5 +363,6 @@ def test_bootstrap_script_recovers_stale_apt_lock_before_commands(
 
     script = (tmp_path / "trial" / "bootstrap" / "bootstrap.sh").read_text()
     assert "/var/lib/apt/lists/lock" in script
+    assert "pkill -9 -x apt " in script
     assert script.index("rm -f") < script.index("apt-get update")
     assert "Acquire::http::Timeout" in script

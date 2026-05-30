@@ -39,11 +39,13 @@ logger = logging.getLogger(__name__)
 # apt/dpkg locks (Harbor's timeout kills the host docker client, not the
 # in-container process), which makes a retried bootstrap fail with
 # "Could not get lock ... (apt-get)" -> exit 100. Recover so the script is safe
-# to re-run, and cap apt's network wait so an unreachable mirror fails fast
-# instead of hanging until the bootstrap timeout. Best-effort: each line
-# tolerates a minimal image (no procps, already-clean locks) via "|| true".
+# to re-run, and cap apt's network wait for bootstrap and later in-task apt
+# usage so an unreachable mirror fails fast instead of hanging until the
+# bootstrap timeout. Best-effort: each line tolerates a minimal image (no
+# procps, already-clean locks) via "|| true".
 _BOOTSTRAP_PREAMBLE = """\
 set -eu
+pkill -9 -x apt 2>/dev/null || true
 pkill -9 -x apt-get 2>/dev/null || true
 pkill -9 -x dpkg 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock 2>/dev/null || true
