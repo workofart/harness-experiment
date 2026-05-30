@@ -29,9 +29,7 @@ class RawState:
 
     Contract notes:
     - `reset()` returns `instruction` and `working_dir`.
-    - `exec()` returns one command result. For bounded observation commands,
-      `next_start_line` and `has_more` are continuation hints owned by the
-      harness-facing contract rather than hidden adapter-private metadata.
+    - `exec()` returns one command result.
     - `verify()` returns the authoritative terminal judgment for the task.
     """
 
@@ -43,8 +41,6 @@ class RawState:
     return_code: int | None = None
     stdout: str | None = None
     stderr: str | None = None
-    next_start_line: int | None = None
-    has_more: bool = False
 
 
 class HarnessEnv(Protocol):
@@ -86,16 +82,17 @@ class TaskResult:
     Returned by `src.experiment.trial.run_task()`, aggregated by the runner
     into `TaskTrials`, persisted to `experiment.json`, and reloaded via
     `from_dict` for diagnosis.
-    In-memory constructors always pass tight values for `solved` and
-    `steps_used`; the `| None` widening covers crash paths that may not reach a
-    terminal verifier outcome.
+    Every constructor passes concrete values for `solved` and `steps_used` —
+    crash and timeout paths resolve to `solved=False` with a recorded step
+    count — so neither is optional. (`reward` stays optional: a trial that
+    never reached the verifier has no reward.)
     """
 
     task_name: str
     reward: float | None = None
-    solved: bool | None = None
+    solved: bool = False
     error: str | None = None
-    steps_used: int | None = None
+    steps_used: int = 0
     trial_dir: str | None = None
     trace_path: str | None = None
     metrics_path: str | None = None
@@ -112,7 +109,7 @@ class TaskResult:
             reward=payload.get("reward"),
             solved=payload["solved"],
             error=payload.get("error"),
-            steps_used=payload.get("steps_used"),
+            steps_used=payload.get("steps_used", 0),
             trial_dir=payload.get("trial_dir"),
             trace_path=payload.get("trace_path"),
             metrics_path=payload.get("metrics_path"),
