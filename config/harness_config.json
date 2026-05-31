@@ -1,6 +1,6 @@
 {
-  "experiment_id": "exp-gpt-5-5-high-small-baseline-0530",
-  "focus_name": "baseline",
+  "experiment_id": "exp-gpt-5-5-high-speed-up-0530",
+  "focus_name": "increase-exp-speed",
   "train_task_names": [
     "openssl-selfsigned-cert",
     "regex-log",
@@ -95,8 +95,8 @@
     "model-extraction-relu-logits"
   ],
   "max_steps": 1000,
-  "max_trial_concurrency": 16,
-  "max_env_concurrency": 10,
+  "max_trial_concurrency": 35,
+  "max_env_concurrency": 6,
   "task_timeout_sec": 1200.0,
   "env_setup_timeout_sec": 600.0,
   "max_output_retries": 2,
