@@ -18,7 +18,8 @@ This module defines the loop-local design:
 - bounded observation rendering for stdout/stderr
 - `act()`: one model completion attempt plus configurable repair retries
 - `run_task_loop()`: execute emitted actions in order until env `done` or
-  `max_steps`, updating optional trace/metrics recorders and progress state
+  `max_steps`, updating optional trace/metrics recorders and the caller-owned
+  `TaskLoopState`
 
 Boundary contracts:
 - Environment adapters implement `src.harness.contracts.HarnessEnv`.
@@ -140,19 +141,24 @@ class VerifyAction(Action):
     NAME: ClassVar[Literal["verify"]] = "verify"
 
 
-@dataclass(frozen=True, slots=True)
-class TaskLoopResult:
-    reward: float
-    solved: bool
-    steps_used: int
-    final_passed: bool | None
-
-
 @dataclass(slots=True)
-class TaskLoopProgress:
+class TaskLoopState:
+    """Mutable per-trial loop outcome, owned by the caller of `run_task_loop`.
+
+    The loop updates this in place after every action, so the caller can read
+    the last observed outcome on both the normal-return path and the path where
+    an outer `asyncio.timeout` cancels the loop mid-flight (a returned value
+    would be lost there). `solved` is derived from `final_passed`, so the loop
+    never sets it independently.
+    """
+
     reward: float = 0.0
     steps_used: int = 0
     final_passed: bool | None = None
+
+    @property
+    def solved(self) -> bool:
+        return self.final_passed is True
 
 
 # ============================================================================
@@ -577,27 +583,23 @@ async def run_task_loop(
     max_steps: int,
     max_output_retries: int = 2,
     recorder: Any = NOOP_HARNESS_RECORDER,
-    progress: TaskLoopProgress | None = None,
-) -> TaskLoopResult:
-    """Run the agent loop after environment reset.
+    state: TaskLoopState,
+) -> None:
+    """Run the agent loop after environment reset, recording into `state`.
 
-    Lifecycle concerns (reset, timeout, artifacts, cleanup, timestamps) live
-    outside the harness; this core loop only decides and executes actions.
+    `state` is caller-owned and updated in place after every action, so the
+    caller can read the last observed outcome even when an outer
+    `asyncio.timeout` cancels this coroutine mid-flight. Lifecycle concerns
+    (reset, timeout, artifacts, cleanup, timestamps) live outside the harness;
+    this core loop only decides and executes actions.
     """
     trajectory: Trajectory = ()
-    steps_used = 0
-    reward: float = 0.0
-    final_passed: bool | None = None
     done = False
-    if progress is not None:
-        progress.reward = reward
-        progress.steps_used = steps_used
-        progress.final_passed = final_passed
 
-    async def run_loop_action(action: Action) -> RawState:
-        nonlocal done, final_passed, reward, steps_used, trajectory
+    async def run_loop_action(action: Action) -> None:
+        nonlocal done, trajectory
 
-        step_index = steps_used + 1
+        step_index = state.steps_used + 1
         step_recorder = recorder.for_step(step_index)
         action_summary = summarize_action(action)
         step_recorder.action_chosen(
@@ -611,20 +613,15 @@ async def run_task_loop(
             raw_state=raw_state,
         )
         trajectory = (*trajectory, (action, raw_state))
-        steps_used += 1
+        state.steps_used += 1
         done = raw_state.done
         if raw_state.reward is not None:
-            reward = raw_state.reward
+            state.reward = raw_state.reward
         if raw_state.done and raw_state.passed is not None:
-            final_passed = raw_state.passed
-        if progress is not None:
-            progress.reward = reward
-            progress.steps_used = steps_used
-            progress.final_passed = final_passed
-        return raw_state
+            state.final_passed = raw_state.passed
 
-    while steps_used < max_steps and not done:
-        step_index = steps_used + 1
+    while state.steps_used < max_steps and not done:
+        step_index = state.steps_used + 1
         step_recorder = recorder.for_step(step_index)
         actions = await act(
             llm=llm,
@@ -635,13 +632,6 @@ async def run_task_loop(
             recorder=step_recorder,
         )
         for action in actions:
-            if done or steps_used >= max_steps:
+            if done or state.steps_used >= max_steps:
                 break
             await run_loop_action(action)
-    solved = final_passed is True
-    return TaskLoopResult(
-        reward=reward,
-        solved=solved,
-        steps_used=steps_used,
-        final_passed=final_passed,
-    )

@@ -85,9 +85,7 @@ class TaskMetrics(BaseModel):
 
     def record_step_passed(self, raw_state: RawState) -> None:
         """Attribute the env outcome to the most recent agent-chosen action.
-        Called only from `env_step_completed` (in-loop) — the forced final
-        verify uses a different code path so its rejection does not get
-        attributed to the last in-loop action."""
+        Called only from `env_step_completed` (in-loop)."""
         if isinstance(raw_state.passed, bool):
             self.final_action_passed = raw_state.passed
 

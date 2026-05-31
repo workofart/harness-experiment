@@ -21,6 +21,7 @@ from src.harness.core import (
     ReadFileAction,
     RunAction,
     SearchTextAction,
+    TaskLoopState,
     VerifyAction,
     WriteFileAction,
     act,
@@ -519,49 +520,55 @@ def test_act_returns_all_calls_in_multi_tool_response():
 def test_run_task_loop_solved_when_verify_returns_passed_true():
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
-    result = asyncio.run(
+    state = TaskLoopState()
+    asyncio.run(
         run_task_loop(
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
             max_steps=5,
+            state=state,
         )
     )
-    assert result.solved is True
-    assert result.reward == 1.0
-    assert result.steps_used == 1
+    assert state.solved is True
+    assert state.reward == 1.0
+    assert state.steps_used == 1
     assert env.verify_calls == 1
 
 
 def test_run_task_loop_unsolved_when_verify_returns_passed_false():
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _StubEnv(verify_state=RawState(done=True, passed=False, reward=0.0))
-    result = asyncio.run(
+    state = TaskLoopState()
+    asyncio.run(
         run_task_loop(
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
             max_steps=5,
+            state=state,
         )
     )
-    assert result.solved is False
-    assert result.reward == 0.0
+    assert state.solved is False
+    assert state.reward == 0.0
 
 
 def test_run_task_loop_unsolved_when_max_steps_reached_without_verify():
     # Seed has no forced final verify -- step exhaustion just returns unsolved.
     llm = _StubLlm([_completion(_tool_call("list_dir", path="/x")) for _ in range(3)])
     env = _StubEnv()
-    result = asyncio.run(
+    state = TaskLoopState()
+    asyncio.run(
         run_task_loop(
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
             max_steps=3,
+            state=state,
         )
     )
-    assert result.solved is False
-    assert result.steps_used == 3
+    assert state.solved is False
+    assert state.steps_used == 3
     assert env.verify_calls == 0
 
 
@@ -577,14 +584,16 @@ def test_run_task_loop_stops_batch_when_action_returns_done_true():
         ]
     )
     env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
-    result = asyncio.run(
+    state = TaskLoopState()
+    asyncio.run(
         run_task_loop(
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
             max_steps=5,
+            state=state,
         )
     )
-    assert result.solved is True
+    assert state.solved is True
     assert env.verify_calls == 1
     assert env.exec_calls == []
