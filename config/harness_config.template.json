@@ -22,13 +22,27 @@
 
   // Maximum task trials in flight (each holds one live container). Keep this at
   // 1 until Docker and API cost behavior is understood. Raise it above
-  // max_env_concurrency to overlap trials that are idling on the LLM.
+  // max_env_concurrency to overlap trials that are idling on the LLM (LLM
+  // requests are remote and absorb concurrency cheaply; the host CPU does not).
   "max_trial_concurrency": 1,
 
   // Maximum trials running heavyweight container work (reset/startup, run,
   // verify) at once. Cheap file/list/search/edit commands bypass this gate.
-  // Bounds host-CPU contention independently of max_trial_concurrency; set near the
-  // core count. No effect when >= max_trial_concurrency. Default 10.
+  // This is the host-CPU contention bound.
+  //
+  // Set it BELOW the host core count, not "near" it: heavy ops (compiles, ML
+  // verifiers) are themselves multi-threaded, so N concurrent ops can demand far
+  // more than N cores. Oversubscribing the cores slows every heavy op, which can
+  // push long trials past task_timeout_sec and turn would-be solves into
+  // timeouts. (A per-container `cpus` cap would bound this, but harbor declares
+  // it under compose `deploy.resources.limits`, which `docker compose up`
+  // ignores outside swarm, so containers currently run uncapped.)
+  //
+  // Interaction with max_trial_concurrency: this gate only binds once
+  // max_trial_concurrency is high enough to keep it saturated (no effect when
+  // >= max_trial_concurrency). So raising max_trial_concurrency for LLM-overlap
+  // throughput is safe only while this stays low enough to keep concurrent heavy
+  // ops under the core count. Default 10; ~half the cores is a safe start.
   "max_env_concurrency": 1,
 
   // Wall-clock timeout for one task trial.
