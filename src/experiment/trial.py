@@ -124,21 +124,7 @@ async def run_task(
     final_passed: bool | None = None
     progress = TaskLoopProgress()
 
-    async def execute_trial() -> TaskResult:
-        nonlocal error
-        nonlocal final_passed
-        nonlocal finished_at
-        nonlocal metrics_path
-        nonlocal recorder
-        nonlocal reset_completed
-        nonlocal reward
-        nonlocal solved
-        nonlocal steps_used
-        nonlocal setup_timeout_ctx
-        nonlocal agent_timeout_ctx
-        nonlocal trial_dir
-        nonlocal verifier_stdout_path
-
+    try:
         # Environment setup (docker start + bootstrap) is budgeted separately
         # from the agent loop so a slow/hung bootstrap fails fast as a crash
         # without consuming the agent's step budget or being misreported as a
@@ -218,9 +204,6 @@ async def run_task(
             started_at=started_at,
             finished_at=finished_at,
         )
-
-    try:
-        return await execute_trial()
     except TimeoutError as exc:
         reward = progress.reward
         steps_used = progress.steps_used
