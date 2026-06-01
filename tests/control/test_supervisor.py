@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -275,6 +276,53 @@ def test_append_supervisor_event_prints_terminal_log(
     captured = capsys.readouterr()
     assert "[supervisor]" in captured.out
     assert "loop_iteration_started" in captured.out
+
+
+def test_launch_tracked_experiment_forwards_progress_bar_without_real_experiment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    experiments_root = tmp_path / "experiments"
+    experiment_id = "exp-streamed"
+    make_record(
+        experiment_id=experiment_id,
+        git_commit_hash="candidate123",
+        parent_baseline_experiment_id="baseline",
+        status="keep",
+        reward=1.0,
+    ).write(root=experiments_root)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                "print('fake exp stdout')",
+                "if not sys.stderr.isatty():",
+                "    raise SystemExit('stderr is not a tty')",
+                "sys.stderr.write('\\r\\033[K[#####-----] 1/2 tasks (50%)\\n')",
+                "sys.stderr.flush()",
+            ]
+        )
+    )
+    fake_uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+
+    record = supervisor.launch_tracked_experiment(
+        repo_root=repo_root,
+        experiment_id=experiment_id,
+        experiments_root=experiments_root,
+    )
+
+    captured = capfd.readouterr()
+    assert record.experiment_id == experiment_id
+    assert "fake exp stdout" in captured.out
+    assert "[#####-----] 1/2 tasks (50%)" in captured.err
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:

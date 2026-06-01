@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import errno
 import json
+import locale
+import os
+import pty
+import selectors
 import shutil
 import subprocess
+import sys
+import tty
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -688,13 +695,7 @@ def launch_tracked_experiment(
     experiment_id: str,
     experiments_root: Path,
 ) -> ExperimentRecord:
-    completed = subprocess.run(
-        ["uv", "run", "exp"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=repo_root,
-    )
+    completed = _run_with_live_tty_output(["uv", "run", "exp"], cwd=repo_root)
     if completed.returncode != 0:
         raise RuntimeError(
             "uv run exp failed:\n"
@@ -707,6 +708,75 @@ def launch_tracked_experiment(
             f"tracked experiment record missing after launch: {record_path}"
         )
     return ExperimentRecord.load(experiment_id, root=experiments_root)
+
+
+def _run_with_live_tty_output(
+    args: list[str],
+    *,
+    cwd: Path,
+) -> subprocess.CompletedProcess[str]:
+    encoding = locale.getencoding()
+    stdout_master, stdout_slave = pty.openpty()
+    stderr_master, stderr_slave = pty.openpty()
+    tty.setraw(stdout_slave)
+    tty.setraw(stderr_slave)
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=stdout_slave,
+        stderr=stderr_slave,
+        close_fds=True,
+    )
+    os.close(stdout_slave)
+    os.close(stderr_slave)
+
+    output_by_fd = {
+        stdout_master: (sys.stdout, []),
+        stderr_master: (sys.stderr, []),
+    }
+    selector = selectors.DefaultSelector()
+    selector.register(stdout_master, selectors.EVENT_READ)
+    selector.register(stderr_master, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            for key, _events in selector.select():
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fd)
+                    os.close(key.fd)
+                    continue
+                stream, chunks = output_by_fd[key.fd]
+                chunks.append(chunk)
+                stream.write(chunk.decode(encoding, errors="replace"))
+                stream.flush()
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=process.wait(),
+            stdout=b"".join(output_by_fd[stdout_master][1]).decode(
+                encoding,
+                errors="replace",
+            ),
+            stderr=b"".join(output_by_fd[stderr_master][1]).decode(
+                encoding,
+                errors="replace",
+            ),
+        )
+    finally:
+        selector.close()
+        for fd in (stdout_master, stderr_master):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def promote_workspace_commit_to_repo(
