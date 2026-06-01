@@ -10,7 +10,7 @@ from src.adapters.llm_base import BaseLlm
 from src.harness.contracts import HarnessEnv, TaskResult
 from src.harness.core import (
     NoValidActionError,
-    TaskLoopProgress,
+    TaskLoopState,
     run_task_loop,
 )
 from src.metrics import FailureMode
@@ -126,7 +126,7 @@ async def run_task(
     failure_mode: str | None = None
     steps_used = 0
     final_passed: bool | None = None
-    progress = TaskLoopProgress()
+    state = TaskLoopState()
 
     try:
         # Environment setup (docker start + bootstrap) is budgeted separately
@@ -158,19 +158,19 @@ async def run_task(
             working_dir=reset_state.working_dir,
         )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
-            outcome = await run_task_loop(
+            await run_task_loop(
                 llm=llm,
                 env=env,
                 reset_state=reset_state,
                 max_steps=max_steps,
                 max_output_retries=max_output_retries,
                 recorder=recorder,
-                progress=progress,
+                state=state,
             )
-        reward = outcome.reward
-        solved = outcome.solved
-        steps_used = outcome.steps_used
-        final_passed = outcome.final_passed
+        reward = state.reward
+        solved = state.solved
+        steps_used = state.steps_used
+        final_passed = state.final_passed
         verifier_stdout_path = env.verifier_stdout_path
         recorder.set_trial_outcome(
             verifier_passed=final_passed,
@@ -191,7 +191,6 @@ async def run_task(
             error=error,
             steps_used=steps_used,
             final_passed=final_passed,
-            forced_final_verify=False,
         )
         return TaskResult(
             task_name=task_name,
@@ -209,12 +208,12 @@ async def run_task(
         )
     except Exception as exc:
         # Timeout and crash exits recover the same partial state, then classify.
-        # asyncio.timeout cancels run_task_loop mid-flight so its TaskLoopResult
-        # never returns -- `progress` is the only carrier of the last observed
-        # reward/steps; `_recover_artifact_paths` re-reads the env's dirs.
-        reward = progress.reward
-        steps_used = progress.steps_used
-        final_passed = progress.final_passed
+        # asyncio.timeout cancels run_task_loop mid-flight so it never returns
+        # normally -- the caller-owned `state` is the only carrier of the last
+        # observed reward/steps; `_recover_artifact_paths` re-reads the env's dirs.
+        reward = state.reward
+        steps_used = state.steps_used
+        final_passed = state.final_passed
         trial_dir, verifier_stdout_path = _recover_artifact_paths(
             env,
             trial_dir=trial_dir,

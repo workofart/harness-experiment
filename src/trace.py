@@ -289,34 +289,6 @@ class HarnessRecorder:
             working_dir=working_dir,
         )
 
-    def final_verify_started(
-        self,
-        *,
-        step_limit_reached: bool,
-        steps_used: int,
-    ) -> None:
-        self._write(
-            "final_verify_started",
-            step_limit_reached=step_limit_reached,
-            steps_used=steps_used,
-        )
-
-    def final_verify_completed(
-        self,
-        *,
-        raw_state: RawState,
-        step_limit_reached: bool,
-        steps_used: int,
-    ) -> None:
-        self._write(
-            "final_verify_completed",
-            done=raw_state.done,
-            passed=raw_state.passed,
-            reward=raw_state.reward,
-            step_limit_reached=step_limit_reached,
-            steps_used=steps_used,
-        )
-
     def task_finished(
         self,
         *,
@@ -326,7 +298,6 @@ class HarnessRecorder:
         error: str | None,
         steps_used: int,
         final_passed: bool | None,
-        forced_final_verify: bool,
     ) -> None:
         self._write(
             "task_finished",
@@ -336,7 +307,6 @@ class HarnessRecorder:
             error=error,
             steps_used=steps_used,
             final_passed=final_passed,
-            forced_final_verify=forced_final_verify,
         )
 
     def task_failed(self, *, exc: BaseException, detail: str) -> None:
