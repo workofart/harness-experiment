@@ -21,10 +21,8 @@
         "large-scale-text-editing",
         "pypi-server",
         "sparql-university",
-        "break-filter-js-from-html",
         "mteb-retrieve",
         "hf-model-inference",
-        "pytorch-model-cli",
         "code-from-image",
         "cancel-async-tasks",
         "extract-elf",
@@ -93,6 +91,13 @@
     }
   ],
   "excluded_task_groups": {
+    "ignored": {
+      "task_names": [
+        "break-filter-js-from-html",
+        "pytorch-model-cli"
+      ],
+      "reason": "held out because the active baseline record lacks these task results"
+    },
     "slow": {
       "task_names": [
         "query-optimize",

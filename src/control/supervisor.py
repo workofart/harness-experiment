@@ -1272,10 +1272,14 @@ def _ensure_baseline_at_head(
             + ", ".join(dirty_paths)
         )
     head_commit = control_repo.get_head_commit(cwd=repo_root)
+    harness_config = snapshot.harness_config
     if baseline is not None and head_commit == baseline.git_commit_hash:
-        return False
+        if _baseline_matches_harness_config(
+            baseline=baseline,
+            harness_config=harness_config,
+        ):
+            return False
     harbor_config, api_key = _load_runtime(repo_root=repo_root)
-    harness_config = load_harness_config_for_repo(repo_root)
     decision_reason: Literal["baseline seed", "baseline rerun"] = (
         "baseline seed" if baseline is None else "baseline rerun"
     )
@@ -1328,3 +1332,17 @@ def _ensure_baseline_at_head(
         commit=new_baseline.git_commit_hash,
     )
     return True
+
+
+def _baseline_matches_harness_config(
+    *,
+    baseline: ExperimentRecord,
+    harness_config: HarnessConfig,
+) -> bool:
+    if baseline.panel_order != [panel.id for panel in harness_config.panels]:
+        return False
+    return all(
+        panel.id in baseline.panels
+        and set(baseline.panels[panel.id].task_ids) == set(panel.task_names)
+        for panel in harness_config.panels
+    )

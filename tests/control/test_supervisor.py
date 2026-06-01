@@ -79,7 +79,10 @@ def freeze_supervisor_time(monkeypatch: pytest.MonkeyPatch, iso_timestamp: str) 
 
 
 def make_harness_config(
-    *, experiment_id: str = "exp-next", focus_name: str = "core"
+    *,
+    experiment_id: str = "exp-next",
+    focus_name: str = "core",
+    task_names: list[str] | None = None,
 ) -> HarnessConfig:
     return HarnessConfig(
         schema_version=2,
@@ -89,7 +92,7 @@ def make_harness_config(
             {
                 "id": "train",
                 "purpose": "promotion",
-                "task_names": ["task-a"],
+                "task_names": ["task-a"] if task_names is None else task_names,
                 "task_timeout_sec": 600.0,
                 "run": {"when": "always"},
                 "baseline": {"required": False},
@@ -2809,6 +2812,78 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
         )
         is None
     )
+
+
+def test_ensure_baseline_at_head_runs_baseline_when_panel_changed_at_same_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    baseline = make_keep_baseline()
+    snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
+    snapshot.harness_config = make_harness_config(task_names=["task-a", "task-b"])
+    (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
+
+    baseline_calls: dict[str, object] = {}
+    synced_commits: list[str] = []
+    new_baseline = make_record(
+        experiment_id="baseline-rerun",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id="baseline",
+        status="keep",
+        reward=1.0,
+    )
+
+    monkeypatch.setattr(
+        supervisor.control_repo,
+        "changed_paths",
+        lambda **_: (),
+    )
+    monkeypatch.setattr(
+        supervisor.control_repo,
+        "get_head_commit",
+        lambda **_: "base123",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_load_runtime",
+        lambda *, repo_root: (
+            SimpleNamespace(experiments_dir=snapshot.experiments_root),
+            "api-key",
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "load_harness_config_for_repo",
+        lambda repo_root: snapshot.harness_config,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "sync_sparse_workspace_to_commit",
+        lambda *, workspace_root, commit_hash: synced_commits.append(commit_hash),
+    )
+
+    def fake_run_baseline(*, harness_config, harbor_config, api_key, **_kwargs):
+        baseline_calls["harness_config"] = harness_config
+        baseline_calls["api_key"] = api_key
+        return new_baseline
+
+    monkeypatch.setattr(
+        supervisor.ExperimentRunner,
+        "run_baseline_at_head",
+        fake_run_baseline,
+    )
+
+    refreshed = supervisor._ensure_baseline_at_head(
+        snapshot=snapshot,
+        repo_root=snapshot.repo_root,
+        workspace_root=tmp_path / "workspace",
+        supervisor_root=tmp_path / "supervisor",
+    )
+
+    assert refreshed is True
+    assert baseline_calls["harness_config"] is snapshot.harness_config
+    assert baseline_calls["api_key"] == "api-key"
+    assert synced_commits == ["base123"]
 
 
 def test_ensure_baseline_at_head_rejects_crashed_baseline_run(

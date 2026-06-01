@@ -71,28 +71,34 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
 def test_default_harness_config_matches_baseline_run_profile():
     config = HarnessConfig.model_validate_json(DEFAULT_HARNESS_CONFIG_PATH.read_text())
     test_panel = config.regression_veto_panel
+    ignored_group = config.excluded_task_groups["ignored"]
     slow_group = config.excluded_task_groups["slow"]
 
     assert [panel.id for panel in config.panels] == ["train", "test"]
-    assert len(config.promotion_panel.task_names) == 51
+    assert len(config.promotion_panel.task_names) == 49
     assert test_panel is not None
     assert len(test_panel.task_names) == 10
+    assert len(ignored_group.task_names) == 2
     assert len(slow_group.task_names) == 28
     assert set(config.promotion_panel.task_names).isdisjoint(test_panel.task_names)
+    assert set(config.promotion_panel.task_names).isdisjoint(ignored_group.task_names)
     assert set(config.promotion_panel.task_names).isdisjoint(slow_group.task_names)
+    assert set(test_panel.task_names).isdisjoint(ignored_group.task_names)
     assert set(test_panel.task_names).isdisjoint(slow_group.task_names)
+    assert set(ignored_group.task_names).isdisjoint(slow_group.task_names)
     assert (
         len(
             set(config.promotion_panel.task_names)
             | set(test_panel.task_names)
+            | set(ignored_group.task_names)
             | set(slow_group.task_names)
         )
         == 89
     )
     assert "gpt2-codegolf" in test_panel.task_names
     assert "configure-git-webserver" in test_panel.task_names
-    assert "break-filter-js-from-html" in config.promotion_panel.task_names
-    assert "pytorch-model-cli" in config.promotion_panel.task_names
+    assert "break-filter-js-from-html" in ignored_group.task_names
+    assert "pytorch-model-cli" in ignored_group.task_names
     assert "vulnerable-secret" in slow_group.task_names
     assert "model-extraction-relu-logits" in slow_group.task_names
     assert "qemu-startup" in slow_group.task_names
