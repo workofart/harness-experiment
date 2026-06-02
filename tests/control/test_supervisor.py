@@ -20,12 +20,40 @@ from src.experiment.record import (
     ExperimentEvidence,
     ExperimentRecord,
     ExperimentState,
+    PanelRecord,
     TaskOutcomeEvidence,
 )
 from src.harness.config import HarnessConfig, OpenRouterConfig
 from src.harness.contracts import TaskResult
 
 from conftest import _write_task_artifacts
+
+
+def train_panel(task_ids: list[str]) -> PanelRecord:
+    return PanelRecord.initialize(
+        panel_id="train",
+        purpose="promotion",
+        task_ids=task_ids,
+        expected_trial_count=1,
+        lifecycle="active",
+    )
+
+
+def init_train_record(
+    *,
+    experiment_id: str,
+    git_commit_hash: str,
+    parent_baseline_experiment_id: str | None,
+    train_task_ids: list[str],
+    started_at: str = "2026-04-11T00:00:00+00:00",
+) -> ExperimentRecord:
+    return ExperimentRecord.initialize(
+        experiment_id=experiment_id,
+        git_commit_hash=git_commit_hash,
+        parent_baseline_experiment_id=parent_baseline_experiment_id,
+        panels=[train_panel(train_task_ids)],
+        started_at=started_at,
+    )
 
 
 class FakeBackend:
@@ -52,12 +80,25 @@ def freeze_supervisor_time(monkeypatch: pytest.MonkeyPatch, iso_timestamp: str) 
 
 
 def make_harness_config(
-    *, experiment_id: str = "exp-next", focus_name: str = "core"
+    *,
+    experiment_id: str = "exp-next",
+    focus_name: str = "core",
+    task_names: list[str] | None = None,
 ) -> HarnessConfig:
     return HarnessConfig(
+        schema_version=2,
         experiment_id=experiment_id,
         focus_name=focus_name,
-        train_task_names=["task-a"],
+        panels=[
+            {
+                "id": "train",
+                "purpose": "promotion",
+                "task_names": ["task-a"] if task_names is None else task_names,
+                "task_timeout_sec": 600.0,
+                "run": {"when": "always"},
+                "baseline": {"required": False},
+            }
+        ],
         llm_provider_config=OpenRouterConfig(
             model_name="openrouter/openai/gpt-oss-20b"
         ),
@@ -119,12 +160,11 @@ def make_record(
     status: str | None,
     reward: float,
 ) -> ExperimentRecord:
-    record = ExperimentRecord.initialize(
+    record = init_train_record(
         experiment_id=experiment_id,
         git_commit_hash=git_commit_hash,
         parent_baseline_experiment_id=parent_baseline_experiment_id,
         train_task_ids=["task-a"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     record.record_task_result(
         TaskResult(
@@ -151,12 +191,11 @@ def make_unfinished_record(
     git_commit_hash: str,
     parent_baseline_experiment_id: str | None,
 ) -> ExperimentRecord:
-    record = ExperimentRecord.initialize(
+    record = init_train_record(
         experiment_id=experiment_id,
         git_commit_hash=git_commit_hash,
         parent_baseline_experiment_id=parent_baseline_experiment_id,
         train_task_ids=["task-a"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     record.record_task_result(
         TaskResult(
@@ -465,15 +504,14 @@ def test_workspace_changed_paths_rejects_contract_changes(tmp_path: Path) -> Non
         supervisor.workspace_changed_paths(workspace_root=workspace_root)
 
 
-def test_latest_evidence_task_artifact_paths_uses_all_relevant_task_outcomes(
+def test_latest_evidence_task_artifact_paths_uses_all_relevant_panel_outcomes(
     tmp_path: Path,
 ) -> None:
-    baseline = ExperimentRecord.initialize(
+    baseline = init_train_record(
         experiment_id="baseline",
         git_commit_hash="base123",
         parent_baseline_experiment_id=None,
         train_task_ids=["task-a", "task-b", "task-c", "task-d"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     for task_name, solved in (
         ("task-a", True),
@@ -498,12 +536,11 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_task_outcomes(
             )
         )
 
-    candidate = ExperimentRecord.initialize(
+    candidate = init_train_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
         parent_baseline_experiment_id="baseline",
         train_task_ids=["task-a", "task-b", "task-c", "task-d"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     candidate_artifacts = {}
     for task_name, solved in (
@@ -537,7 +574,7 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_task_outcomes(
     # active baseline as the entire pool for this unit test.
     pool = {
         tid: (trials.solved_count, trials.trial_count)
-        for tid, trials in baseline.train_task_results.items()
+        for tid, trials in baseline.panels["train"].task_results.items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
     candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
@@ -605,28 +642,29 @@ def test_latest_evidence_task_artifact_paths_omits_missing_paths(
     tmp_path: Path,
 ) -> None:
     artifacts = _write_task_artifacts(tmp_path / "candidate", "task-a")
-    record = ExperimentRecord.initialize(
+    record = init_train_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
         parent_baseline_experiment_id="baseline",
         train_task_ids=["task-a"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     record.evidence = ExperimentEvidence(
         candidate_change=CandidateChangeEvidence(commit="candidate123"),
-        task_outcomes=[
-            TaskOutcomeEvidence(
-                task_id="task-a",
-                baseline_solved=True,
-                candidate_solved=False,
-                outcome="regression",
-                trial_dir=artifacts["trial_dir"],
-                agent_steps_path=artifacts["trace_path"],
-                agent_exec_log_path=artifacts["exec_log_path"],
-                metrics_path=artifacts["metrics_path"],
-                verifier_stdout_path=str(tmp_path / "candidate" / "missing.txt"),
-            )
-        ],
+        panel_outcomes={
+            "train": [
+                TaskOutcomeEvidence(
+                    task_id="task-a",
+                    baseline_solved=True,
+                    candidate_solved=False,
+                    outcome="regression",
+                    trial_dir=artifacts["trial_dir"],
+                    agent_steps_path=artifacts["trace_path"],
+                    agent_exec_log_path=artifacts["exec_log_path"],
+                    metrics_path=artifacts["metrics_path"],
+                    verifier_stdout_path=str(tmp_path / "candidate" / "missing.txt"),
+                )
+            ]
+        },
     )
 
     assert supervisor.latest_evidence_task_artifact_paths(record) == (
@@ -1187,7 +1225,9 @@ def test_prepare_candidate_rejects_config_only_focus_name_churn(
     ("mutate_config", "write_core_diff"),
     [
         pytest.param(
-            lambda updated: updated.update(train_task_names=["task-a", "task-b"]),
+            lambda updated: updated["panels"][0].update(
+                task_names=["task-a", "task-b"]
+            ),
             False,
             id="task-panel",
         ),
@@ -2294,17 +2334,17 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
     assert updated.status == "crash"
     assert updated.error == "abandoned after supervisor restart"
     assert updated.finished_at is not None
-    updated_task_a = updated.train_task_results["task-a"]
+    updated_task_a = updated.panels["train"].task_results["task-a"]
     assert updated_task_a.is_finished
     assert updated_task_a.trials[-1].error == "abandoned after supervisor restart"
     assert updated_task_a.trials[-1].metrics.failure_mode == "interrupted"
     assert updated.evidence is not None
     assert updated.evidence.candidate_change.parent_baseline_commit == "base123"
-    assert len(updated.evidence.task_outcomes) == 1
-    assert updated.evidence.task_outcomes[0].baseline_solved is True
+    assert len(updated.evidence.panel_outcomes["train"]) == 1
+    assert updated.evidence.panel_outcomes["train"][0].baseline_solved is True
     # The abandoned trial is `interrupted` (error set), excluded from evidence,
     # so the candidate has no valid trials and no solve verdict.
-    assert updated.evidence.task_outcomes[0].candidate_solved is None
+    assert updated.evidence.panel_outcomes["train"][0].candidate_solved is None
     assert update_ref_calls == [
         (supervisor.failed_experiment_git_ref("exp-next"), "candidate123")
     ]
@@ -2822,6 +2862,78 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
     )
 
 
+def test_ensure_baseline_at_head_runs_baseline_when_panel_changed_at_same_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    baseline = make_keep_baseline()
+    snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
+    snapshot.harness_config = make_harness_config(task_names=["task-a", "task-b"])
+    (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
+
+    baseline_calls: dict[str, object] = {}
+    synced_commits: list[str] = []
+    new_baseline = make_record(
+        experiment_id="baseline-rerun",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id="baseline",
+        status="keep",
+        reward=1.0,
+    )
+
+    monkeypatch.setattr(
+        supervisor.control_repo,
+        "changed_paths",
+        lambda **_: (),
+    )
+    monkeypatch.setattr(
+        supervisor.control_repo,
+        "get_head_commit",
+        lambda **_: "base123",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_load_runtime",
+        lambda *, repo_root: (
+            SimpleNamespace(experiments_dir=snapshot.experiments_root),
+            "api-key",
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "load_harness_config_for_repo",
+        lambda repo_root: snapshot.harness_config,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "sync_sparse_workspace_to_commit",
+        lambda *, workspace_root, commit_hash: synced_commits.append(commit_hash),
+    )
+
+    def fake_run_baseline(*, harness_config, harbor_config, api_key, **_kwargs):
+        baseline_calls["harness_config"] = harness_config
+        baseline_calls["api_key"] = api_key
+        return new_baseline
+
+    monkeypatch.setattr(
+        supervisor.ExperimentRunner,
+        "run_baseline_at_head",
+        fake_run_baseline,
+    )
+
+    refreshed = supervisor._ensure_baseline_at_head(
+        snapshot=snapshot,
+        repo_root=snapshot.repo_root,
+        workspace_root=tmp_path / "workspace",
+        supervisor_root=tmp_path / "supervisor",
+    )
+
+    assert refreshed is True
+    assert baseline_calls["harness_config"] is snapshot.harness_config
+    assert baseline_calls["api_key"] == "api-key"
+    assert synced_commits == ["base123"]
+
+
 def test_ensure_baseline_at_head_rejects_crashed_baseline_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2900,12 +3012,11 @@ def test_cleanup_orphaned_experiment_artifacts_removes_partial_launch_state(
     partial_dir.mkdir()
     (partial_dir / "scratch.txt").write_text("partial\n")
 
-    orphan = ExperimentRecord.initialize(
+    orphan = init_train_record(
         experiment_id="orphan-exp",
         git_commit_hash="candidate123",
         parent_baseline_experiment_id="baseline",
         train_task_ids=["task-a"],
-        started_at="2026-04-11T00:00:00+00:00",
     )
     orphan.write(root=snapshot.experiments_root)
 
