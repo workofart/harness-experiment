@@ -63,12 +63,14 @@ def test_task_directory_resolver_prefers_local_task_override(tmp_path: Path) -> 
     overrides_dir = tmp_path / "overrides"
     override_task_dir = overrides_dir / "task-a"
     _write_minimal_task(override_task_dir)
-    task_dirs = TaskDirectoryResolver(
-        HarborConfig(
-            experiments_dir=tmp_path / "experiments",
-            task_overrides_dir=overrides_dir,
-        )
-    ).resolve(["task-a"])
+    task_dirs = asyncio.run(
+        TaskDirectoryResolver(
+            HarborConfig(
+                experiments_dir=tmp_path / "experiments",
+                task_overrides_dir=overrides_dir,
+            )
+        ).resolve(["task-a"])
+    )
 
     assert task_dirs == {"task-a": override_task_dir.resolve()}
 
@@ -110,12 +112,14 @@ def test_task_directory_resolver_falls_back_to_registry_download_when_override_a
     )
     monkeypatch.setattr(tasks_client, "TaskClient", FakeTaskClient)
 
-    task_dirs = TaskDirectoryResolver(
-        HarborConfig(
-            experiments_dir=tmp_path / "experiments",
-            task_overrides_dir=tmp_path / "overrides",
-        )
-    ).resolve(["task-a"])
+    task_dirs = asyncio.run(
+        TaskDirectoryResolver(
+            HarborConfig(
+                experiments_dir=tmp_path / "experiments",
+                task_overrides_dir=tmp_path / "overrides",
+            )
+        ).resolve(["task-a"])
+    )
 
     assert task_dirs == {"task-a": downloaded_task_dir}
 
@@ -152,13 +156,15 @@ def test_task_directory_resolver_uses_dataset_version_for_registry_metadata(
     )
     monkeypatch.setattr(tasks_client, "TaskClient", FakeTaskClient)
 
-    task_dirs = TaskDirectoryResolver(
-        HarborConfig(
-            experiments_dir=tmp_path / "experiments",
-            task_overrides_dir=tmp_path / "overrides",
-            dataset_version="v1",
-        )
-    ).resolve(["task-a"])
+    task_dirs = asyncio.run(
+        TaskDirectoryResolver(
+            HarborConfig(
+                experiments_dir=tmp_path / "experiments",
+                task_overrides_dir=tmp_path / "overrides",
+                dataset_version="v1",
+            )
+        ).resolve(["task-a"])
+    )
 
     assert task_dirs == {"task-a": downloaded_task_dir}
 
@@ -171,12 +177,14 @@ def test_task_directory_resolver_rejects_invalid_local_task_override(
     (invalid_override_dir / "instruction.md").write_text("incomplete\n")
 
     with pytest.raises(RuntimeError, match="local task override is invalid"):
-        TaskDirectoryResolver(
-            HarborConfig(
-                experiments_dir=tmp_path / "experiments",
-                task_overrides_dir=tmp_path / "overrides",
-            )
-        ).resolve(["task-a"])
+        asyncio.run(
+            TaskDirectoryResolver(
+                HarborConfig(
+                    experiments_dir=tmp_path / "experiments",
+                    task_overrides_dir=tmp_path / "overrides",
+                )
+            ).resolve(["task-a"])
+        )
 
 
 def _stub_harbor_with_inner_exec(
@@ -706,7 +714,12 @@ def test_harbor_verify_runs_separate_verifier_environment(
         task_dir=task_dir,
     )
 
-    async def fail_docker_cli(args):
+    async def fail_docker_cli(
+        args,
+        *,
+        failure_context="Docker command failed",
+    ):
+        del failure_context
         raise AssertionError(f"prebuilt verifier image should not build: {args}")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
@@ -764,7 +777,12 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
     existing_images: set[str] = set()
     docker_calls: list[list[str]] = []
 
-    async def fake_docker_cli(args: list[str]) -> ExecResult:
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
         docker_calls.append(args)
         if args[:3] == ["image", "inspect", "--format"]:
             image_name = args[-1]
@@ -818,7 +836,12 @@ def test_harbor_auto_converts_shared_tasks_to_official_separate_verifier(
     existing_images: set[str] = set()
     docker_calls: list[list[str]] = []
 
-    async def fake_docker_cli(args: list[str]) -> ExecResult:
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
         docker_calls.append(args)
         if args[:3] == ["image", "inspect", "--format"]:
             image_name = args[-1]
@@ -966,7 +989,12 @@ def test_stop_docker_environment_fallback_cleans_only_same_compose_project(
     calls: list[list[str]] = []
     expected_label = "label=com.docker.compose.project=task-name__run-id"
 
-    async def fake_docker_cli(args: list[str]) -> ExecResult:
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
         calls.append(args)
         if args == [
             "container",
@@ -1028,7 +1056,12 @@ def test_stop_docker_environment_raises_when_compose_and_fallback_cleanup_fail(
         side_effect=RuntimeError("compose down failed")
     )
 
-    async def fake_docker_cli(args: list[str]) -> ExecResult:
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
         raise RuntimeError("docker API unavailable")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
@@ -1048,6 +1081,8 @@ def test_run_docker_cli_reports_combined_output_on_failure(tmp_path: Path) -> No
         asyncio.run(harbor._run_docker_cli(["definitely-not-a-real-docker-command"]))
 
     message = str(exc_info.value)
+    assert message.startswith("Docker command failed.")
+    assert "Docker cleanup command failed." not in message
     assert "Output:" in message
     assert "Stderr: None" not in message
 

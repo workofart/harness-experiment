@@ -655,7 +655,8 @@ class Harbor:
     async def _docker_image_exists(self, image_name: str) -> bool:
         try:
             await self._run_docker_cli(
-                ["image", "inspect", "--format", "{{.Id}}", image_name]
+                ["image", "inspect", "--format", "{{.Id}}", image_name],
+                failure_context="Docker image inspect failed",
             )
         except RuntimeError:
             return False
@@ -672,7 +673,8 @@ class Harbor:
             if await self._docker_image_exists(image_name):
                 return
             await self._run_docker_cli(
-                ["build", "--tag", image_name, str(build_context.resolve())]
+                ["build", "--tag", image_name, str(build_context.resolve())],
+                failure_context="Docker image build failed",
             )
 
     async def _verifier_env_config_with_cached_image(
@@ -814,7 +816,12 @@ class Harbor:
             raise RuntimeError("failed to detect environment working directory")
         return result.stdout.strip()
 
-    async def _run_docker_cli(self, args: list[str]) -> ExecResult:
+    async def _run_docker_cli(
+        self,
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
         process = await asyncio.create_subprocess_exec(
             "docker",
             *args,
@@ -831,7 +838,7 @@ class Harbor:
         )
         if result.return_code != 0:
             raise RuntimeError(
-                "Docker cleanup command failed. "
+                f"{failure_context}. "
                 f"Command: docker {' '.join(args)}. "
                 f"Return code: {result.return_code}. "
                 f"Output: {result.stdout}."
@@ -858,7 +865,10 @@ class Harbor:
         args = [resource, "ls", "--quiet", "--filter", label]
         if resource == "container":
             args.insert(2, "--all")
-        result = await self._run_docker_cli(args)
+        result = await self._run_docker_cli(
+            args,
+            failure_context="Docker cleanup command failed",
+        )
         return [line for line in (result.stdout or "").splitlines() if line]
 
     async def _cleanup_docker_project_by_label(self, project_name: str) -> None:
@@ -868,7 +878,8 @@ class Harbor:
         )
         if container_ids:
             await self._run_docker_cli(
-                ["container", "rm", "--force", "--volumes", *container_ids]
+                ["container", "rm", "--force", "--volumes", *container_ids],
+                failure_context="Docker cleanup command failed",
             )
 
         volume_ids = await self._docker_ids_by_project_label(
@@ -876,14 +887,20 @@ class Harbor:
             project_name=project_name,
         )
         if volume_ids:
-            await self._run_docker_cli(["volume", "rm", "--force", *volume_ids])
+            await self._run_docker_cli(
+                ["volume", "rm", "--force", *volume_ids],
+                failure_context="Docker cleanup command failed",
+            )
 
         network_ids = await self._docker_ids_by_project_label(
             resource="network",
             project_name=project_name,
         )
         if network_ids:
-            await self._run_docker_cli(["network", "rm", *network_ids])
+            await self._run_docker_cli(
+                ["network", "rm", *network_ids],
+                failure_context="Docker cleanup command failed",
+            )
 
     async def _stop_environment(self, env: BaseEnvironment) -> None:
         from harbor.environments.docker.docker import DockerEnvironment
@@ -933,7 +950,7 @@ class TaskDirectoryResolver:
     def __init__(self, config: HarborConfig) -> None:
         self.config = config
 
-    def resolve(self, task_names: list[str]) -> dict[str, Path]:
+    async def resolve(self, task_names: list[str]) -> dict[str, Path]:
         resolved: dict[str, Path] = {}
         needs_registry: list[str] = []
         for task_name in dict.fromkeys(task_names):
@@ -953,7 +970,7 @@ class TaskDirectoryResolver:
         dataset_ref = self.config.dataset_name
         if self.config.dataset_version is not None:
             dataset_ref = f"{dataset_ref}@{self.config.dataset_version}"
-        metadata = asyncio.run(registry_client.get_dataset_metadata(dataset_ref))
+        metadata = await registry_client.get_dataset_metadata(dataset_ref)
         task_ids = list(metadata.task_ids)
         pending_ids = []
         for task_name in needs_registry:
@@ -973,8 +990,8 @@ class TaskDirectoryResolver:
             pending_ids.append((task_name, matches[0]))
 
         task_client = TaskClient()
-        downloaded = asyncio.run(
-            task_client.download_tasks([task_id for _, task_id in pending_ids])
+        downloaded = await task_client.download_tasks(
+            [task_id for _, task_id in pending_ids]
         )
         for (task_name, _), path in zip(pending_ids, downloaded.paths, strict=True):
             resolved[task_name] = path
