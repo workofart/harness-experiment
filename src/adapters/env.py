@@ -12,10 +12,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
-from harbor.models.task.paths import TaskPaths
 from harbor.models.task.task import Task
-from harbor.models.trial.config import EnvironmentConfig
-from harbor.models.trial.paths import TrialPaths
+from harbor.models.trial.config import EnvironmentConfig, ServiceVolumeConfig
+from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.verifier.verifier import Verifier
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -107,13 +106,39 @@ _CPU_THREAD_ENV_KEYS = (
 )
 
 
-def _cpu_resource_env(cpus: int) -> dict[str, str]:
+def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
+    if cpus is None:
+        return {"TOKENIZERS_PARALLELISM": "false"}
     cap = str(cpus)
     return {
         **{key: cap for key in _CPU_THREAD_ENV_KEYS},
         "MAKEFLAGS": f"-j{cap}",
         "TOKENIZERS_PARALLELISM": "false",
     }
+
+
+def _trial_log_mounts(
+    trial_paths: TrialPaths,
+    task: Task,
+) -> list[ServiceVolumeConfig]:
+    env_paths = EnvironmentPaths.for_os(task.config.environment.os)
+    return [
+        {
+            "type": "bind",
+            "source": str(trial_paths.agent_dir.resolve()),
+            "target": str(env_paths.agent_dir),
+        },
+        {
+            "type": "bind",
+            "source": str(trial_paths.verifier_dir.resolve()),
+            "target": str(env_paths.verifier_dir),
+        },
+        {
+            "type": "bind",
+            "source": str(trial_paths.artifacts_dir.resolve()),
+            "target": str(env_paths.artifacts_dir),
+        },
+    ]
 
 
 @dataclass
@@ -130,6 +155,7 @@ class _ResourceCappedEnvironment:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult:
         merged_env = dict(self.resource_env)
         if env is not None:
@@ -139,6 +165,7 @@ class _ResourceCappedEnvironment:
             cwd=cwd,
             env=merged_env,
             timeout_sec=timeout_sec,
+            user=user,
         )
 
 
@@ -362,6 +389,7 @@ class Harbor:
             session_id=session_id,
             trial_paths=trial_paths,
             task_env_config=task.config.environment,
+            mounts=_trial_log_mounts(trial_paths, task),
         )
         try:
             async with self._env_gate():
@@ -489,9 +517,13 @@ class Harbor:
 
     @staticmethod
     def _docker_compose_project_name(env: BaseEnvironment) -> str:
+        from harbor.environments.docker.docker import (
+            _sanitize_docker_compose_project_name,
+        )
+
         # Must stay in sync with Harbor's private DockerEnvironment
         # `docker compose -p` derivation; drift makes label cleanup a no-op.
-        return env.session_id.lower().replace(".", "-")
+        return _sanitize_docker_compose_project_name(env.session_id)
 
     async def _docker_ids_by_project_label(
         self,
@@ -595,14 +627,16 @@ class TaskDirectoryResolver:
         from harbor.tasks.client import TaskClient
 
         registry_client = RegistryClientFactory.create()
-        dataset = registry_client.get_dataset_spec(
-            self.config.dataset_name,
-            self.config.dataset_version,
-        )
-        task_client = TaskClient()
+        dataset_ref = self.config.dataset_name
+        if self.config.dataset_version is not None:
+            dataset_ref = f"{dataset_ref}@{self.config.dataset_version}"
+        metadata = asyncio.run(registry_client.get_dataset_metadata(dataset_ref))
+        task_ids = list(metadata.task_ids)
         pending_ids = []
         for task_name in needs_registry:
-            matches = [task for task in dataset.tasks if task.name == task_name]
+            matches = [
+                task_id for task_id in task_ids if task_id.get_name() == task_name
+            ]
             if not matches:
                 raise ValueError(
                     f"Task `{task_name}` was not found in dataset "
@@ -613,12 +647,13 @@ class TaskDirectoryResolver:
                     f"Task `{task_name}` matched multiple registry entries in "
                     f"`{self.config.dataset_name}`."
                 )
-            pending_ids.append((task_name, matches[0].to_source_task_id()))
+            pending_ids.append((task_name, matches[0]))
 
-        downloaded = task_client.download_tasks(
-            [source_id for _, source_id in pending_ids]
+        task_client = TaskClient()
+        downloaded = asyncio.run(
+            task_client.download_tasks([task_id for _, task_id in pending_ids])
         )
-        for (task_name, _), path in zip(pending_ids, downloaded, strict=True):
+        for (task_name, _), path in zip(pending_ids, downloaded.paths, strict=True):
             resolved[task_name] = path
         return resolved
 
@@ -630,6 +665,6 @@ class TaskDirectoryResolver:
         if not override_dir.exists():
             return None
 
-        if not TaskPaths(override_dir).is_valid():
+        if not Task.is_valid_dir(override_dir):
             raise RuntimeError(f"local task override is invalid: {override_dir}")
         return override_dir

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
+from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
@@ -16,7 +18,7 @@ from src.adapters.env import Harbor, HarborConfig, TaskDirectoryResolver
 def _write_minimal_task(
     task_dir: Path,
     *,
-    cpus: int = 1,
+    cpus: int | None = 1,
     verifier_env: dict[str, str] | None = None,
 ) -> None:
     (task_dir / "environment").mkdir(parents=True)
@@ -28,8 +30,9 @@ def _write_minimal_task(
         "",
         "[environment]",
         'docker_image = "example/task:latest"',
-        f"cpus = {cpus}",
     ]
+    if cpus is not None:
+        task_toml.append(f"cpus = {cpus}")
     if verifier_env:
         task_toml.extend(["", "[verifier.env]"])
         task_toml.extend(f'{key} = "{value}"' for key, value in verifier_env.items())
@@ -60,24 +63,28 @@ def test_task_directory_resolver_falls_back_to_registry_download_when_override_a
     from harbor.tasks import client as tasks_client
 
     downloaded_task_dir = tmp_path / "downloaded-task"
-    source_task_id = object()
 
-    class FakeTask:
-        name = "task-a"
+    class FakeTaskId:
+        def __init__(self, name: str) -> None:
+            self.name = name
 
-        def to_source_task_id(self):
-            return source_task_id
+        def get_name(self) -> str:
+            return self.name
+
+    source_task_id = FakeTaskId("task-a")
 
     class FakeRegistryClient:
-        def get_dataset_spec(self, dataset_name, dataset_version):
+        async def get_dataset_metadata(self, dataset_name):
             assert dataset_name == "terminal-bench"
-            assert dataset_version is None
-            return type("Dataset", (), {"tasks": [FakeTask()]})()
+            return SimpleNamespace(task_ids=[source_task_id])
+
+        async def download_dataset(self, dataset_name):
+            raise AssertionError(f"unexpected full dataset download: {dataset_name}")
 
     class FakeTaskClient:
-        def download_tasks(self, task_ids):
+        async def download_tasks(self, task_ids):
             assert task_ids == [source_task_id]
-            return [downloaded_task_dir]
+            return SimpleNamespace(paths=[downloaded_task_dir])
 
     monkeypatch.setattr(
         registry_factory.RegistryClientFactory,
@@ -90,6 +97,49 @@ def test_task_directory_resolver_falls_back_to_registry_download_when_override_a
         HarborConfig(
             experiments_dir=tmp_path / "experiments",
             task_overrides_dir=tmp_path / "overrides",
+        )
+    ).resolve(["task-a"])
+
+    assert task_dirs == {"task-a": downloaded_task_dir}
+
+
+def test_task_directory_resolver_uses_dataset_version_for_registry_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor.registry.client import factory as registry_factory
+    from harbor.tasks import client as tasks_client
+
+    downloaded_task_dir = tmp_path / "downloaded-task"
+
+    class FakeTaskId:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def get_name(self) -> str:
+            return self.name
+
+    class FakeRegistryClient:
+        async def get_dataset_metadata(self, name):
+            assert name == "terminal-bench@v1"
+            return SimpleNamespace(task_ids=[FakeTaskId("task-a")])
+
+    class FakeTaskClient:
+        async def download_tasks(self, task_ids):
+            assert [task_id.get_name() for task_id in task_ids] == ["task-a"]
+            return SimpleNamespace(paths=[downloaded_task_dir])
+
+    monkeypatch.setattr(
+        registry_factory.RegistryClientFactory,
+        "create",
+        staticmethod(lambda: FakeRegistryClient()),
+    )
+    monkeypatch.setattr(tasks_client, "TaskClient", FakeTaskClient)
+
+    task_dirs = TaskDirectoryResolver(
+        HarborConfig(
+            experiments_dir=tmp_path / "experiments",
+            task_overrides_dir=tmp_path / "overrides",
+            dataset_version="v1",
         )
     ).resolve(["task-a"])
 
@@ -185,6 +235,8 @@ def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> Non
 
 class RecordingEnvironment:
     is_mounted = True
+    os = TaskOS.LINUX
+    capabilities = SimpleNamespace(mounted=True)
 
     def __init__(self, reward_path: Path | None = None) -> None:
         self.reward_path = reward_path
@@ -202,6 +254,7 @@ class RecordingEnvironment:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult:
         self.exec_calls.append(
             {
@@ -209,9 +262,10 @@ class RecordingEnvironment:
                 "cwd": cwd,
                 "env": env,
                 "timeout_sec": timeout_sec,
+                "user": user,
             }
         )
-        if self.reward_path is not None and command.startswith("/tests/test.sh"):
+        if self.reward_path is not None and "/tests/test.sh" in command:
             self.reward_path.write_text("1.0")
         return ExecResult(return_code=0, stdout="", stderr="")
 
@@ -219,7 +273,7 @@ class RecordingEnvironment:
 def _attach_recording_harbor(
     tmp_path: Path,
     *,
-    cpus: int,
+    cpus: int | None,
     verifier_env: dict[str, str] | None = None,
 ) -> tuple[Harbor, RecordingEnvironment]:
     task_dir = tmp_path / "task"
@@ -255,6 +309,17 @@ def test_harbor_exec_applies_declared_cpu_resource_caps(tmp_path: Path) -> None:
     assert env["TOKENIZERS_PARALLELISM"] == "false"
 
 
+def test_harbor_exec_does_not_invent_cpu_caps_when_task_cpu_is_unspecified(
+    tmp_path: Path,
+) -> None:
+    harbor, environment = _attach_recording_harbor(tmp_path, cpus=None)
+
+    asyncio.run(harbor.exec(command="python -c pass"))
+
+    env = environment.exec_calls[-1]["env"]
+    assert env == {"TOKENIZERS_PARALLELISM": "false"}
+
+
 def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
     tmp_path: Path,
 ) -> None:
@@ -268,6 +333,7 @@ def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
 
     chmod_env = environment.exec_calls[0]["env"]
     verifier_env = environment.exec_calls[1]["env"]
+    assert environment.exec_calls[0]["user"] == "root"
     assert chmod_env["OMP_NUM_THREADS"] == "3"
     assert verifier_env["OMP_NUM_THREADS"] == "7"
     assert verifier_env["OPENBLAS_NUM_THREADS"] == "3"
@@ -398,10 +464,15 @@ def test_harbor_reset_serializes_startup_under_shared_semaphore(
             await asyncio.sleep(0.01)
             order.append(f"exit:{self.name}")
 
-        async def exec(self, *, command, cwd=None, env=None, timeout_sec=None):
-            del cwd, env, timeout_sec
+        async def exec(
+            self, *, command, cwd=None, env=None, timeout_sec=None, user=None
+        ):
+            del cwd, env, timeout_sec, user
             assert command == "pwd"
             return ExecResult(return_code=0, stdout="/app\n", stderr="")
+
+        async def stop(self, *, delete: bool):
+            del delete
 
     def fake_create_environment_from_config(**kwargs):
         return FakeEnvironment(kwargs["environment_name"])
@@ -439,6 +510,53 @@ def test_harbor_reset_serializes_startup_under_shared_semaphore(
         ["enter:task-a", "exit:task-a", "enter:task-b", "exit:task-b"],
         ["enter:task-b", "exit:task-b", "enter:task-a", "exit:task-a"],
     )
+
+
+def test_harbor_reset_passes_trial_log_mounts_to_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor.environments.factory import EnvironmentFactory
+
+    captured_mounts = []
+
+    class FakeEnvironment:
+        async def start(self, *, force_build: bool) -> None:
+            del force_build
+
+        async def exec(
+            self, *, command, cwd=None, env=None, timeout_sec=None, user=None
+        ):
+            del cwd, env, timeout_sec, user
+            assert command == "pwd"
+            return ExecResult(return_code=0, stdout="/app\n", stderr="")
+
+        async def stop(self, *, delete: bool):
+            del delete
+
+    def fake_create_environment_from_config(**kwargs):
+        captured_mounts.extend(kwargs["mounts"])
+        return FakeEnvironment()
+
+    monkeypatch.setattr(
+        EnvironmentFactory,
+        "create_environment_from_config",
+        staticmethod(fake_create_environment_from_config),
+    )
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    asyncio.run(harbor.reset())
+    asyncio.run(harbor.close())
+
+    mounts_by_target = {mount["target"]: mount for mount in captured_mounts}
+    assert mounts_by_target["/logs/agent"]["source"].endswith("/agent")
+    assert mounts_by_target["/logs/verifier"]["source"].endswith("/verifier")
+    assert mounts_by_target["/logs/artifacts"]["source"].endswith("/artifacts")
 
 
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:
