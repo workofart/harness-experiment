@@ -758,6 +758,51 @@ def test_harbor_verify_runs_separate_verifier_environment(
     assert agent_env.stop_calls == [True]
 
 
+def test_long_separate_verifier_session_ids_remain_cleanup_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_name = f"task-{'a' * 40}"
+    task_dir = tmp_path / task_name
+    _write_minimal_task(
+        task_dir,
+        verifier_docker_image="example/verifier:latest",
+    )
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name=task_name,
+        task_dir=task_dir,
+    )
+
+    async def fail_docker_cli(
+        args,
+        *,
+        failure_context="Docker command failed",
+    ):
+        del failure_context
+        raise AssertionError(f"prebuilt verifier image should not build: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    asyncio.run(harbor.verify())
+
+    verifier_session_id = create_calls[1]["session_id"]
+    run_id = harbor.session.trial_paths.trial_dir.name
+    assert len(verifier_session_id) <= 63
+    assert verifier_session_id.endswith(f"__{run_id}__verifier")
+    assert harbor._is_stale_cleanup_candidate_project(verifier_session_id)
+
+    prefix, digest, suffix = verifier_session_id.split("__", 2)
+    other_digest = "ffffffff" if digest != "ffffffff" else "00000000"
+    assert not harbor._is_stale_cleanup_candidate_project(
+        f"{prefix}__{other_digest}__{suffix}"
+    )
+
+    asyncio.run(harbor.close())
+
+
 def test_harbor_verify_caches_dockerfile_verifier_image(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1059,7 +1104,7 @@ def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projec
 ) -> None:
     harbor = Harbor(
         HarborConfig(experiments_dir=tmp_path / "experiments"),
-        task_name="task-a",
+        task_name="Task.A",
         task_dir=tmp_path / "task",
     )
     removed_projects: list[str] = []
@@ -1087,13 +1132,23 @@ def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projec
             },
             {
                 "ID": "verifier-stopped",
-                "State": "created",
+                "State": "dead",
                 "Labels": "com.docker.compose.project=task-a__20260603-120000-abcdef12__verifier",
             },
             {
                 "ID": "agent-running",
                 "State": "running",
                 "Labels": "com.docker.compose.project=task-a__20260603-120001-abcdef12",
+            },
+            {
+                "ID": "agent-created",
+                "State": "created",
+                "Labels": "com.docker.compose.project=task-a__20260603-120002-abcdef12",
+            },
+            {
+                "ID": "verifier-removing",
+                "State": "removing",
+                "Labels": "com.docker.compose.project=task-a__20260603-120003-abcdef12__verifier",
             },
             {
                 "ID": "other-compose",
@@ -1104,6 +1159,11 @@ def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projec
                 "ID": "other-task-stopped",
                 "State": "exited",
                 "Labels": "com.docker.compose.project=task-b__20260603-120000-abcdef12",
+            },
+            {
+                "ID": "substring-task-stopped",
+                "State": "exited",
+                "Labels": "com.docker.compose.project=task-a__b__20260603-120000-abcdef12",
             },
         ]
         return ExecResult(
@@ -1124,6 +1184,53 @@ def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projec
         "task-a__20260603-120000-abcdef12",
         "task-a__20260603-120000-abcdef12__verifier",
     ]
+
+
+def test_cleanup_stale_docker_projects_skips_malformed_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+    removed_projects: list[str] = []
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del args, failure_context
+        rows = [
+            "{not-json",
+            json.dumps({"ID": "missing-labels", "State": "exited"}),
+            json.dumps(
+                {
+                    "ID": "missing-state",
+                    "Labels": "com.docker.compose.project=task-a__20260603-120000-abcdef12",
+                }
+            ),
+            json.dumps(
+                {
+                    "ID": "valid",
+                    "State": "exited",
+                    "Labels": "com.docker.compose.project=task-a__20260603-120001-abcdef12",
+                }
+            ),
+        ]
+        return ExecResult(return_code=0, stdout="\n".join(rows), stderr=None)
+
+    async def fake_cleanup(project_name: str) -> None:
+        removed_projects.append(project_name)
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    monkeypatch.setattr(harbor, "_cleanup_docker_project_by_label", fake_cleanup)
+
+    asyncio.run(harbor._cleanup_stale_docker_compose_projects())
+
+    assert removed_projects == ["task-a__20260603-120001-abcdef12"]
 
 
 def test_harbor_reset_runs_stale_docker_project_cleanup(

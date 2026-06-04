@@ -40,11 +40,12 @@ DEFAULT_HARBOR_CONFIG_PATH = (
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
+_HARBOR_RUN_ID_EXAMPLE = "20260603-120000-abcdef12"
 _VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
-_HARBOR_COMPOSE_PROJECT_RE = re.compile(
-    r"^[a-z0-9][a-z0-9_-]*__\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
+_HARBOR_COMPOSE_PROJECT_SUFFIX_RE = re.compile(
+    r"^\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
 )
-_ACTIVE_DOCKER_STATES = frozenset({"running", "restarting", "paused"})
+_TERMINAL_DOCKER_STATES = frozenset({"dead", "exited"})
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,26 @@ def _directory_content_hash(directory: Path) -> str:
         elif path.is_dir():
             digest.update(b"D")
     return digest.hexdigest()
+
+
+def _safe_verifier_session_text(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "-._" else "_" for char in value)
+
+
+def _compact_verifier_task_session_prefix(task_name: str) -> str | None:
+    safe_task = _safe_verifier_session_text(task_name)
+    if (
+        len(f"{safe_task}__{_HARBOR_RUN_ID_EXAMPLE}__verifier")
+        <= _MAX_VERIFIER_ENV_SESSION_ID_LEN
+    ):
+        return None
+
+    digest = hashlib.sha1(safe_task.encode()).hexdigest()[:8]
+    suffix_len = len(f"__{digest}__{_HARBOR_RUN_ID_EXAMPLE}__verifier")
+    task_prefix = safe_task[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - suffix_len].rstrip(
+        "-._"
+    )
+    return f"{task_prefix or digest}__{digest}__"
 
 
 def _trial_log_mounts(
@@ -531,15 +552,16 @@ class Harbor:
             )
 
     def _separate_verifier_session_id(self) -> str:
-        raw = f"{self.task_name}__{self.session.trial_paths.trial_dir.name}__verifier"
-        safe = "".join(char if char.isalnum() or char in "-._" else "_" for char in raw)
+        run_id = self.session.trial_paths.trial_dir.name
+        raw = f"{self.task_name}__{run_id}__verifier"
+        safe = _safe_verifier_session_text(raw)
         if len(safe) <= _MAX_VERIFIER_ENV_SESSION_ID_LEN:
             return safe
 
-        digest = hashlib.sha1(safe.encode()).hexdigest()[:8]
-        suffix = f"__{digest}"
-        prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
-        return f"{prefix}{suffix}"
+        compact_prefix = _compact_verifier_task_session_prefix(self.task_name)
+        if compact_prefix is None:
+            return safe
+        return f"{compact_prefix}{run_id}__verifier"
 
     def _verifier_cache_image_name(self, build_context: Path) -> str:
         from harbor.environments.docker.docker import _sanitize_docker_image_name
@@ -774,6 +796,19 @@ class Harbor:
 
         return f"{_sanitize_docker_compose_project_name(self.task_name)}__"
 
+    def _docker_compose_cleanup_project_prefixes(self) -> tuple[str, ...]:
+        from harbor.environments.docker.docker import (
+            _sanitize_docker_compose_project_name,
+        )
+
+        prefixes = [self._docker_compose_task_project_prefix()]
+        compact_verifier_prefix = _compact_verifier_task_session_prefix(self.task_name)
+        if compact_verifier_prefix is not None:
+            prefixes.append(
+                _sanitize_docker_compose_project_name(compact_verifier_prefix)
+            )
+        return tuple(prefixes)
+
     async def _docker_ids_by_project_label(
         self,
         *,
@@ -829,9 +864,11 @@ class Harbor:
         raise ValueError("Docker compose project label is missing")
 
     def _is_stale_cleanup_candidate_project(self, project_name: str) -> bool:
-        if _HARBOR_COMPOSE_PROJECT_RE.fullmatch(project_name) is None:
-            return False
-        return project_name.startswith(self._docker_compose_task_project_prefix())
+        for prefix in self._docker_compose_cleanup_project_prefixes():
+            if project_name.startswith(prefix):
+                suffix = project_name[len(prefix) :]
+                return _HARBOR_COMPOSE_PROJECT_SUFFIX_RE.fullmatch(suffix) is not None
+        return False
 
     async def _cleanup_stale_docker_compose_projects(self) -> None:
         if (
@@ -854,13 +891,20 @@ class Harbor:
         )
         project_states: dict[str, set[str]] = {}
         for line in (result.stdout or "").splitlines():
-            row = json.loads(line)
-            project_name = self._docker_compose_project_label(row["Labels"])
+            try:
+                row = json.loads(line)
+                project_name = self._docker_compose_project_label(row["Labels"])
+                state = row["State"]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                logger.debug(
+                    "Skipping malformed Docker compose container row: %r", line
+                )
+                continue
             if self._is_stale_cleanup_candidate_project(project_name):
-                project_states.setdefault(project_name, set()).add(row["State"])
+                project_states.setdefault(project_name, set()).add(state)
 
         for project_name, states in sorted(project_states.items()):
-            if states & _ACTIVE_DOCKER_STATES:
+            if not states <= _TERMINAL_DOCKER_STATES:
                 continue
             try:
                 await self._cleanup_docker_project_by_label(project_name)
