@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
+import re
 import tomllib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -39,6 +41,10 @@ DEFAULT_HARBOR_CONFIG_PATH = (
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
 _VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+_HARBOR_COMPOSE_PROJECT_RE = re.compile(
+    r"^[a-z0-9][a-z0-9_-]*__\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
+)
+_ACTIVE_DOCKER_STATES = frozenset({"running", "restarting", "paused"})
 
 logger = logging.getLogger(__name__)
 
@@ -426,6 +432,8 @@ class Harbor:
         if self._session is not None:
             await self.close()
 
+        await self._cleanup_stale_docker_compose_projects()
+
         run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
         session_id = f"{self.task_name}__{run_id}"
         trial_paths = TrialPaths(
@@ -759,6 +767,13 @@ class Harbor:
         # `docker compose -p` derivation; drift makes label cleanup a no-op.
         return _sanitize_docker_compose_project_name(env.session_id)
 
+    def _docker_compose_task_project_prefix(self) -> str:
+        from harbor.environments.docker.docker import (
+            _sanitize_docker_compose_project_name,
+        )
+
+        return f"{_sanitize_docker_compose_project_name(self.task_name)}__"
+
     async def _docker_ids_by_project_label(
         self,
         *,
@@ -805,6 +820,56 @@ class Harbor:
                 ["network", "rm", *network_ids],
                 failure_context="Docker cleanup command failed",
             )
+
+    @staticmethod
+    def _docker_compose_project_label(labels: str) -> str:
+        for label in labels.split(","):
+            if label.startswith("com.docker.compose.project="):
+                return label.split("=", 1)[1]
+        raise ValueError("Docker compose project label is missing")
+
+    def _is_stale_cleanup_candidate_project(self, project_name: str) -> bool:
+        if _HARBOR_COMPOSE_PROJECT_RE.fullmatch(project_name) is None:
+            return False
+        return project_name.startswith(self._docker_compose_task_project_prefix())
+
+    async def _cleanup_stale_docker_compose_projects(self) -> None:
+        if (
+            not self.config.environment.delete
+            or self.config.environment.type != EnvironmentType.DOCKER
+        ):
+            return
+
+        result = await self._run_docker_cli(
+            [
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                "label=com.docker.compose.project",
+                "--format",
+                "{{json .}}",
+            ],
+            failure_context="Docker stale container listing failed",
+        )
+        project_states: dict[str, set[str]] = {}
+        for line in (result.stdout or "").splitlines():
+            row = json.loads(line)
+            project_name = self._docker_compose_project_label(row["Labels"])
+            if self._is_stale_cleanup_candidate_project(project_name):
+                project_states.setdefault(project_name, set()).add(row["State"])
+
+        for project_name, states in sorted(project_states.items()):
+            if states & _ACTIVE_DOCKER_STATES:
+                continue
+            try:
+                await self._cleanup_docker_project_by_label(project_name)
+            except RuntimeError as exc:
+                logger.warning(
+                    "Failed to clean stale Docker compose project %r: %s",
+                    project_name,
+                    exc,
+                )
 
     async def _stop_environment(self, env: BaseEnvironment) -> None:
         from harbor.environments.docker.docker import DockerEnvironment
