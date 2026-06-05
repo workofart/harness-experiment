@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import tomllib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -39,9 +40,13 @@ DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
+VERIFIER_CONTEXT_DOCKERFILE_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent / "verifier_context.Dockerfile"
+)
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
 _HARBOR_RUN_ID_EXAMPLE = "20260603-120000-abcdef12"
 _VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+_VERIFIER_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
 _HARBOR_COMPOSE_PROJECT_SUFFIX_RE = re.compile(
     r"^\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
 )
@@ -71,6 +76,13 @@ pkill -9 -x dpkg 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock 2>/dev/null || true
 rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend 2>/dev/null || true
 rm -f /var/cache/apt/archives/lock 2>/dev/null || true
+# Some published task images ship a hermetic shim at /usr/bin/apt-get whose
+# `update` subcommand is a no-op (exit 0, fetches nothing), keeping the real
+# binary at apt-get.real. That silently breaks any setup/verify step which
+# installs a package the image did not pre-bake (e.g. git-multibranch's verify
+# installs `expect`). Restore the real apt so it works normally through our
+# apt-cacher-ng proxy. No-op on images without the shim.
+[ -e /usr/bin/apt-get.real ] && cp -f /usr/bin/apt-get.real /usr/bin/apt-get 2>/dev/null || true
 mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true
 cat > /etc/apt/apt.conf.d/99-harness-bootstrap 2>/dev/null <<'EOF' || true
 Acquire::Retries "3";
@@ -132,6 +144,34 @@ def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
     }
 
 
+# OrbStack -- and some other Docker setups -- inject a `no_proxy`/`NO_PROXY` into
+# every container listing OrbStack's internal IPv6 ULA range (e.g. `::1` and
+# `fd07:...::/64`). httpx cannot parse a bare IPv6 entry in no_proxy: it splits
+# each entry on ':' to peel off a port, then reads the address bytes as the port
+# and raises `httpx.InvalidURL: Invalid port: '...'` at Client construction. Any
+# task that builds an httpx client then crashes before its first request -- most
+# commonly huggingface_hub v1.x (pulled in by `datasets`), so every HF download
+# dies and silently falls back to the offline cache, surfacing as a misleading
+# "cache not found". The injection is intentional and OrbStack rewrites
+# ~/.docker/config.json on every engine restart, so a host-side edit does not
+# stick; stripping the IPv6 entries from no_proxy in each exec's env instead is
+# restart-proof and a no-op on hosts that inject no IPv6.
+#   httpx fix (open):     https://github.com/encode/httpx/pull/3741
+#                         (encode/httpx Issues are disabled; the PR closes the
+#                          original report #3221)
+#   same bug in requests: https://github.com/psf/requests/issues/6313
+#   OrbStack injection:   https://github.com/orbstack/orbstack/issues/2449
+_NO_PROXY_ENV_KEYS = ("no_proxy", "NO_PROXY")
+
+
+def _strip_ipv6_no_proxy(value: str) -> str:
+    # A no_proxy entry is a hostname, domain suffix, IPv4 address, IPv4 CIDR, or
+    # host:port -- none carry more than one ':'. An entry with two or more colons
+    # is therefore an IPv6 address or CIDR, which is exactly what trips httpx.
+    # Drop those and keep everything else in its original order.
+    return ",".join(token for token in value.split(",") if token.count(":") < 2)
+
+
 def _directory_content_hash(directory: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(directory.rglob("*")):
@@ -148,6 +188,14 @@ def _directory_content_hash(directory: Path) -> str:
                     digest.update(chunk)
         elif path.is_dir():
             digest.update(b"D")
+    return digest.hexdigest()
+
+
+def _string_hash(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode())
+        digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -245,7 +293,9 @@ class HarborSession:
     raw_environment: BaseEnvironment
     verifier: Verifier | None
     verifier_env_config: TaskEnvironmentConfig | None
-    verifier_build_context: Path
+    verifier_build_context: Path | None
+    verifier_extra_artifacts: tuple[str, ...] = ()
+    working_dir: str | None = None
 
 
 class HarborConfig(BaseModel):
@@ -259,6 +309,7 @@ class HarborConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     experiments_dir: Path = Path("experiments")
+    verifier_contexts_dir: Path | None = None
     dataset_name: str = "terminal-bench"
     dataset_version: str | None = None
     task_overrides_dir: Path | None = DEFAULT_TASK_OVERRIDES_DIR
@@ -270,9 +321,18 @@ class HarborConfig(BaseModel):
     @model_validator(mode="after")
     def resolve_paths(self) -> "HarborConfig":
         self.experiments_dir = self.experiments_dir.resolve()
+        if self.verifier_contexts_dir is None:
+            self.verifier_contexts_dir = self.experiments_dir / "_verifier_contexts"
+        self.verifier_contexts_dir = self.verifier_contexts_dir.resolve()
         if self.task_overrides_dir is not None:
             self.task_overrides_dir = self.task_overrides_dir.resolve()
         return self
+
+    @property
+    def verifier_context_cache_dir(self) -> Path:
+        if self.verifier_contexts_dir is None:
+            raise RuntimeError("verifier_contexts_dir was not resolved")
+        return self.verifier_contexts_dir
 
     @classmethod
     def from_toml(
@@ -370,9 +430,20 @@ class Harbor:
             task.config,
             step_cfg=None,
         )
+        verifier_build_context: Path | None = task.paths.tests_dir
         # Default to fresh verifier environments; keep stateful service tasks
         # shared so their agent-started localhost services remain testable.
         if (
+            self.task_name not in self.config.shared_verifier_task_names
+            and task.config.verifier.environment_mode is None
+            and task.config.verifier.environment is None
+        ):
+            verifier_env_config = task.config.environment.model_copy(
+                deep=True,
+                update={"docker_image": None},
+            )
+            verifier_build_context = None
+        elif (
             self.task_name not in self.config.shared_verifier_task_names
             and task.config.verifier.environment_mode is None
         ):
@@ -394,8 +465,36 @@ class Harbor:
                 )
             ),
             verifier_env_config=verifier_env_config,
-            verifier_build_context=task.paths.tests_dir,
+            verifier_build_context=verifier_build_context,
         )
+
+    async def _sanitize_no_proxy(
+        self,
+        environment: _ResourceCappedEnvironment,
+    ) -> None:
+        """Strip httpx-breaking IPv6 entries from the container's injected
+        `no_proxy`/`NO_PROXY` (see `_strip_ipv6_no_proxy`).
+
+        Reads the values the container was started with and, for any that carry
+        an IPv6 entry, pins a cleaned override into ``resource_env`` so every
+        later exec (agent actions and the in-container verifier) inherits it.
+        Best-effort: a probe failure leaves the env untouched -- the bug is
+        benign for tasks that never construct an httpx client.
+        """
+        probe = "; ".join(f'printf "%s\\n" "${{{key}-}}"' for key in _NO_PROXY_ENV_KEYS)
+        try:
+            result = await environment.exec(command=probe, timeout_sec=10)
+        except Exception as exc:  # noqa: BLE001 -- best-effort, never fail a trial
+            logger.debug("no_proxy probe skipped for %s: %s", self.task_name, exc)
+            return
+        if result.return_code != 0 or result.stdout is None:
+            return
+        for key, raw in zip(_NO_PROXY_ENV_KEYS, result.stdout.splitlines()):
+            if not raw:
+                continue
+            cleaned = _strip_ipv6_no_proxy(raw)
+            if cleaned != raw:
+                environment.resource_env[key] = cleaned
 
     async def _bootstrap_environment(self) -> None:
         commands = self.config.bootstrap_commands
@@ -493,8 +592,12 @@ class Harbor:
                     trial_paths=trial_paths,
                     harbor_environment=harbor_environment,
                 )
+                await self._sanitize_no_proxy(self.session.environment)
                 await self._bootstrap_environment()
                 working_dir = await self._detect_working_dir()
+                self.session.working_dir = working_dir
+                if self.session.verifier_build_context is None:
+                    self.session.verifier_extra_artifacts = (working_dir,)
             return RawState(
                 instruction=task.instruction,
                 working_dir=working_dir,
@@ -596,7 +699,47 @@ class Harbor:
         )
 
     async def _verifier_build_context(self) -> Path:
-        return self.session.verifier_build_context
+        if self.session.verifier_build_context is not None:
+            return self.session.verifier_build_context
+        return await self._ensure_generated_verifier_context()
+
+    def _generated_verifier_context_dir(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        digest = _string_hash(
+            "auto-separated-verifier-v1",
+            base_image,
+            working_dir,
+            _directory_content_hash(self.session.task.paths.tests_dir),
+        )[:16]
+        return self.config.verifier_context_cache_dir / self.session.task.name / digest
+
+    async def _ensure_generated_verifier_context(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        context_dir = self._generated_verifier_context_dir()
+        lock = _VERIFIER_CONTEXT_LOCKS.setdefault(str(context_dir), asyncio.Lock())
+        async with lock:
+            if (context_dir / "Dockerfile").exists():
+                return context_dir
+
+            context_dir.parent.mkdir(parents=True, exist_ok=True)
+            if context_dir.exists():
+                shutil.rmtree(context_dir)
+            shutil.copytree(self.session.task.paths.tests_dir, context_dir)
+            (context_dir / "Dockerfile").write_text(
+                VERIFIER_CONTEXT_DOCKERFILE_TEMPLATE_PATH.read_text().format(
+                    base_image=base_image,
+                    working_dir=working_dir,
+                )
+            )
+        return context_dir
 
     async def _docker_image_exists(self, image_name: str) -> bool:
         try:
@@ -654,6 +797,7 @@ class Harbor:
             self.session.environment,
             self.session.trial_paths.artifacts_dir,
             source_artifacts_dir=agent_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
         )
 
     async def _upload_separate_verifier_artifacts(
@@ -669,7 +813,41 @@ class Harbor:
             artifacts_dir=self.session.trial_paths.artifacts_dir,
             source_artifacts_dir=agent_env_paths.artifacts_dir,
             target_artifacts_dir=verifier_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
         )
+
+    async def _apply_verifier_network_preamble(
+        self,
+        verifier_environment: _ResourceCappedEnvironment,
+    ) -> None:
+        """Give the separate verifier container the same apt/pip cache + retry
+        and timeout policy the agent container already gets via
+        `_BOOTSTRAP_PREAMBLE`.
+
+        The task's verifier `test.sh` is immutable and runs its own toolchain
+        install (`apt-get`, `uv`, `pip`). Without this it goes direct to live
+        mirrors with no timeout, so a flaky mirror can stall the entire trial
+        budget and the grade never runs. The preamble only writes proxy and
+        retry/timeout config -- nothing task- or run-derived -- so verifier
+        isolation is unchanged; it is also a no-op when the caches are
+        unreachable (the proxy lines are guarded by a reachability probe).
+        Best-effort: a failure here must never fail the grade, so the verifier
+        falls back to the previous direct-fetch behaviour.
+        """
+        try:
+            # Harbor runs every Linux exec under `bash -c`, so the preamble's
+            # heredocs and `/dev/tcp` reachability probe work as-is.
+            await verifier_environment.exec(
+                command=_BOOTSTRAP_PREAMBLE,
+                user="root",
+                timeout_sec=30,
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort network hardening
+            logger.debug(
+                "verifier network preamble skipped for %s: %s",
+                self.session.task.name,
+                exc,
+            )
 
     @contextlib.asynccontextmanager
     async def _separate_verifier_environment(
@@ -699,10 +877,12 @@ class Harbor:
         )
         try:
             await raw_environment.start(force_build=False)
-            yield _ResourceCappedEnvironment(
+            verifier_environment = _ResourceCappedEnvironment(
                 raw_environment,
                 _cpu_resource_env(verifier_env_config.cpus),
             )
+            await self._sanitize_no_proxy(verifier_environment)
+            yield verifier_environment
         finally:
             try:
                 await asyncio.shield(self._stop_environment(raw_environment))
@@ -727,6 +907,7 @@ class Harbor:
                     chmod=True,
                 )
                 await self._upload_separate_verifier_artifacts(verifier_environment)
+                await self._apply_verifier_network_preamble(verifier_environment)
                 verifier = Verifier(
                     task=self.session.task,
                     trial_paths=self.session.trial_paths,

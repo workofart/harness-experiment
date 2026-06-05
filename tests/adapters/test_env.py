@@ -14,7 +14,13 @@ from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
-from src.adapters.env import Harbor, HarborConfig, TaskDirectoryResolver
+from src.adapters.env import (
+    Harbor,
+    HarborConfig,
+    TaskDirectoryResolver,
+    _ResourceCappedEnvironment,
+    _strip_ipv6_no_proxy,
+)
 
 
 def _write_minimal_task(
@@ -168,6 +174,22 @@ def test_task_directory_resolver_uses_dataset_version_for_registry_metadata(
     )
 
     assert task_dirs == {"task-a": downloaded_task_dir}
+
+
+def test_verifier_context_cache_dir_is_stable_when_trial_config_scopes_experiments(
+    tmp_path: Path,
+) -> None:
+    config = HarborConfig(experiments_dir=tmp_path / "experiments")
+    trial_config = config.model_copy(
+        update={"experiments_dir": config.experiments_dir / "exp-id" / "tasks"}
+    )
+
+    assert (
+        config.verifier_context_cache_dir
+        == tmp_path / "experiments" / "_verifier_contexts"
+    )
+    assert trial_config.experiments_dir == config.experiments_dir / "exp-id" / "tasks"
+    assert trial_config.verifier_context_cache_dir == config.verifier_context_cache_dir
 
 
 def test_task_directory_resolver_rejects_invalid_local_task_override(
@@ -369,6 +391,91 @@ def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
     assert verifier_env["OMP_NUM_THREADS"] == "7"
     assert verifier_env["OPENBLAS_NUM_THREADS"] == "3"
     assert verifier_env["CUSTOM_ENV"] == "set"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # OrbStack's real injection: keep hostnames / IPv4 / IPv4-CIDR / domain
+        # suffixes, drop the IPv6 address and IPv6 CIDR that crash httpx.
+        (
+            "localhost,127.0.0.1,::1,10.0.0.0/8,fd07:b51a:cc66:f0::/64,*.orb.internal",
+            "localhost,127.0.0.1,10.0.0.0/8,*.orb.internal",
+        ),
+        # host:port (single colon) survives; a bare IPv6 (>=2 colons) is dropped.
+        ("cache:3142,fe80::1", "cache:3142"),
+        # No IPv6 entry -> returned unchanged.
+        ("localhost,127.0.0.1,.example.com", "localhost,127.0.0.1,.example.com"),
+    ],
+)
+def test_strip_ipv6_no_proxy(value: str, expected: str) -> None:
+    assert _strip_ipv6_no_proxy(value) == expected
+
+
+class _NoProxyProbeEnvironment:
+    os = TaskOS.LINUX
+    capabilities = SimpleNamespace(mounted=True)
+
+    def __init__(self, *, no_proxy: str, no_proxy_upper: str = "") -> None:
+        self._values = (no_proxy, no_proxy_upper)
+        self.exec_calls: list[dict[str, object]] = []
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        del cwd, timeout_sec, user
+        self.exec_calls.append({"command": command, "env": env})
+        if "printf" in command and "no_proxy" in command:
+            # Emulate the container echoing its injected values, in probe order.
+            return ExecResult(
+                return_code=0,
+                stdout=f"{self._values[0]}\n{self._values[1]}\n",
+                stderr="",
+            )
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+
+def _sanitize_harbor(tmp_path: Path) -> Harbor:
+    return Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+
+
+def test_sanitize_no_proxy_pins_cleaned_override_and_it_flows_into_execs(
+    tmp_path: Path,
+) -> None:
+    harbor = _sanitize_harbor(tmp_path)
+    raw = _NoProxyProbeEnvironment(no_proxy="localhost,::1,10.0.0.0/8")
+    capped = _ResourceCappedEnvironment(raw, {"TOKENIZERS_PARALLELISM": "false"})
+
+    asyncio.run(harbor._sanitize_no_proxy(capped))
+
+    # The lowercase value carried IPv6 -> a cleaned override is pinned; the empty
+    # uppercase value is left untouched (no spurious key).
+    assert capped.resource_env["no_proxy"] == "localhost,10.0.0.0/8"
+    assert "NO_PROXY" not in capped.resource_env
+
+    # The override now rides on every later exec, overriding the container's env.
+    asyncio.run(capped.exec(command="python -c pass"))
+    assert raw.exec_calls[-1]["env"]["no_proxy"] == "localhost,10.0.0.0/8"
+
+
+def test_sanitize_no_proxy_is_noop_without_ipv6(tmp_path: Path) -> None:
+    harbor = _sanitize_harbor(tmp_path)
+    raw = _NoProxyProbeEnvironment(no_proxy="localhost,127.0.0.1")
+    capped = _ResourceCappedEnvironment(raw, {})
+
+    asyncio.run(harbor._sanitize_no_proxy(capped))
+
+    assert "no_proxy" not in capped.resource_env
+    assert "NO_PROXY" not in capped.resource_env
 
 
 def test_harbor_close_uses_raw_environment_for_lifecycle_cleanup(
@@ -700,6 +807,34 @@ def _patch_lifecycle_environment_factory(
     return created_envs, create_calls
 
 
+def _patch_docker_image_cache(
+    harbor: Harbor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    existing_images: set[str] = set()
+    docker_calls: list[list[str]] = []
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
+        docker_calls.append(args)
+        if args[:3] == ["image", "inspect", "--format"]:
+            image_name = args[-1]
+            if image_name not in existing_images:
+                raise RuntimeError(f"No such image: {image_name}")
+            return ExecResult(return_code=0, stdout="sha256:cached\n", stderr=None)
+        if args[:2] == ["build", "--tag"]:
+            existing_images.add(args[2])
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    return docker_calls
+
+
 def test_harbor_verify_runs_separate_verifier_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -870,6 +1005,45 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
     assert created_envs[0].stop_calls == [True]
 
 
+def test_harbor_separate_verifier_applies_network_preamble_as_root_before_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, _create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    _patch_docker_image_cache(harbor, monkeypatch)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    result = asyncio.run(harbor.verify())
+
+    assert result.passed is True
+    # The separate verifier container must receive the same apt/pip cache and
+    # retry/timeout config the agent gets, applied as root before the immutable
+    # test.sh runs its own toolchain install -- otherwise a flaky mirror stalls
+    # the whole grade.
+    verifier_env = created_envs[1]
+    commands = [str(call["command"]) for call in verifier_env.exec_calls]
+    preamble_idx = next(
+        i
+        for i, command in enumerate(commands)
+        if "host.docker.internal:3142" in command and "Acquire::http::Proxy" in command
+    )
+    test_idx = next(
+        i for i, command in enumerate(commands) if "/tests/test.sh" in command
+    )
+    assert preamble_idx < test_idx
+    assert verifier_env.exec_calls[preamble_idx]["user"] == "root"
+
+    asyncio.run(harbor.close())
+
+
 def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -882,15 +1056,7 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
         task_dir=task_dir,
     )
 
-    async def fail_docker_cli(
-        args: list[str],
-        *,
-        failure_context: str = "Docker command failed",
-    ) -> ExecResult:
-        del failure_context
-        raise AssertionError(f"default separate verifier should not build: {args}")
-
-    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
+    docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
     monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
 
     asyncio.run(harbor.reset())
@@ -904,11 +1070,50 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     agent_call = create_calls[0]
     verifier_call = create_calls[1]
     assert agent_call["environment_dir"] == task_dir / "environment"
-    assert verifier_call["environment_dir"] == task_dir / "tests"
-    assert verifier_call["task_env_config"].docker_image == "example/task:latest"
+    assert verifier_call["environment_dir"] != task_dir / "tests"
+    assert verifier_call["task_env_config"].docker_image.startswith("hb-verifier-cache")
+    assert [args[:2] for args in docker_calls].count(["build", "--tag"]) == 1
     assert not any(
         source == task_dir / "tests" for source, _ in agent_env.upload_dir_calls
     )
+
+    asyncio.run(harbor.close())
+
+
+def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    asyncio.run(harbor.verify())
+    asyncio.run(harbor.verify())
+
+    verifier_context = create_calls[1]["environment_dir"]
+    reused_verifier_context = create_calls[2]["environment_dir"]
+    assert verifier_context != task_dir / "tests"
+    assert reused_verifier_context == verifier_context
+    assert verifier_context.parent.parent == harbor.config.verifier_context_cache_dir
+    assert (verifier_context / "test.sh").read_text() == "#!/bin/bash\n"
+    assert (verifier_context / "Dockerfile").read_text() == (
+        "FROM example/task:latest\n"
+        "WORKDIR /app\n"
+        "COPY . /tests/\n"
+        "RUN chmod +x /tests/test.sh && mkdir -p /logs/verifier /logs/artifacts\n"
+    )
+    build_calls = [args for args in docker_calls if args[:2] == ["build", "--tag"]]
+    assert len(build_calls) == 1
+    assert build_calls[0][-1] == str(verifier_context.resolve())
 
     asyncio.run(harbor.close())
 
