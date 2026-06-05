@@ -144,6 +144,34 @@ def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
     }
 
 
+# OrbStack -- and some other Docker setups -- inject a `no_proxy`/`NO_PROXY` into
+# every container listing OrbStack's internal IPv6 ULA range (e.g. `::1` and
+# `fd07:...::/64`). httpx cannot parse a bare IPv6 entry in no_proxy: it splits
+# each entry on ':' to peel off a port, then reads the address bytes as the port
+# and raises `httpx.InvalidURL: Invalid port: '...'` at Client construction. Any
+# task that builds an httpx client then crashes before its first request -- most
+# commonly huggingface_hub v1.x (pulled in by `datasets`), so every HF download
+# dies and silently falls back to the offline cache, surfacing as a misleading
+# "cache not found". The injection is intentional and OrbStack rewrites
+# ~/.docker/config.json on every engine restart, so a host-side edit does not
+# stick; stripping the IPv6 entries from no_proxy in each exec's env instead is
+# restart-proof and a no-op on hosts that inject no IPv6.
+#   httpx fix (open):     https://github.com/encode/httpx/pull/3741
+#                         (encode/httpx Issues are disabled; the PR closes the
+#                          original report #3221)
+#   same bug in requests: https://github.com/psf/requests/issues/6313
+#   OrbStack injection:   https://github.com/orbstack/orbstack/issues/2449
+_NO_PROXY_ENV_KEYS = ("no_proxy", "NO_PROXY")
+
+
+def _strip_ipv6_no_proxy(value: str) -> str:
+    # A no_proxy entry is a hostname, domain suffix, IPv4 address, IPv4 CIDR, or
+    # host:port -- none carry more than one ':'. An entry with two or more colons
+    # is therefore an IPv6 address or CIDR, which is exactly what trips httpx.
+    # Drop those and keep everything else in its original order.
+    return ",".join(token for token in value.split(",") if token.count(":") < 2)
+
+
 def _directory_content_hash(directory: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(directory.rglob("*")):
@@ -440,6 +468,34 @@ class Harbor:
             verifier_build_context=verifier_build_context,
         )
 
+    async def _sanitize_no_proxy(
+        self,
+        environment: _ResourceCappedEnvironment,
+    ) -> None:
+        """Strip httpx-breaking IPv6 entries from the container's injected
+        `no_proxy`/`NO_PROXY` (see `_strip_ipv6_no_proxy`).
+
+        Reads the values the container was started with and, for any that carry
+        an IPv6 entry, pins a cleaned override into ``resource_env`` so every
+        later exec (agent actions and the in-container verifier) inherits it.
+        Best-effort: a probe failure leaves the env untouched -- the bug is
+        benign for tasks that never construct an httpx client.
+        """
+        probe = "; ".join(f'printf "%s\\n" "${{{key}-}}"' for key in _NO_PROXY_ENV_KEYS)
+        try:
+            result = await environment.exec(command=probe, timeout_sec=10)
+        except Exception as exc:  # noqa: BLE001 -- best-effort, never fail a trial
+            logger.debug("no_proxy probe skipped for %s: %s", self.task_name, exc)
+            return
+        if result.return_code != 0 or result.stdout is None:
+            return
+        for key, raw in zip(_NO_PROXY_ENV_KEYS, result.stdout.splitlines()):
+            if not raw:
+                continue
+            cleaned = _strip_ipv6_no_proxy(raw)
+            if cleaned != raw:
+                environment.resource_env[key] = cleaned
+
     async def _bootstrap_environment(self) -> None:
         commands = self.config.bootstrap_commands
         if not commands:
@@ -536,6 +592,7 @@ class Harbor:
                     trial_paths=trial_paths,
                     harbor_environment=harbor_environment,
                 )
+                await self._sanitize_no_proxy(self.session.environment)
                 await self._bootstrap_environment()
                 working_dir = await self._detect_working_dir()
                 self.session.working_dir = working_dir
@@ -820,10 +877,12 @@ class Harbor:
         )
         try:
             await raw_environment.start(force_build=False)
-            yield _ResourceCappedEnvironment(
+            verifier_environment = _ResourceCappedEnvironment(
                 raw_environment,
                 _cpu_resource_env(verifier_env_config.cpus),
             )
+            await self._sanitize_no_proxy(verifier_environment)
+            yield verifier_environment
         finally:
             try:
                 await asyncio.shield(self._stop_environment(raw_environment))

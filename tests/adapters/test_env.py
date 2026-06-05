@@ -14,7 +14,13 @@ from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
-from src.adapters.env import Harbor, HarborConfig, TaskDirectoryResolver
+from src.adapters.env import (
+    Harbor,
+    HarborConfig,
+    TaskDirectoryResolver,
+    _ResourceCappedEnvironment,
+    _strip_ipv6_no_proxy,
+)
 
 
 def _write_minimal_task(
@@ -385,6 +391,91 @@ def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
     assert verifier_env["OMP_NUM_THREADS"] == "7"
     assert verifier_env["OPENBLAS_NUM_THREADS"] == "3"
     assert verifier_env["CUSTOM_ENV"] == "set"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # OrbStack's real injection: keep hostnames / IPv4 / IPv4-CIDR / domain
+        # suffixes, drop the IPv6 address and IPv6 CIDR that crash httpx.
+        (
+            "localhost,127.0.0.1,::1,10.0.0.0/8,fd07:b51a:cc66:f0::/64,*.orb.internal",
+            "localhost,127.0.0.1,10.0.0.0/8,*.orb.internal",
+        ),
+        # host:port (single colon) survives; a bare IPv6 (>=2 colons) is dropped.
+        ("cache:3142,fe80::1", "cache:3142"),
+        # No IPv6 entry -> returned unchanged.
+        ("localhost,127.0.0.1,.example.com", "localhost,127.0.0.1,.example.com"),
+    ],
+)
+def test_strip_ipv6_no_proxy(value: str, expected: str) -> None:
+    assert _strip_ipv6_no_proxy(value) == expected
+
+
+class _NoProxyProbeEnvironment:
+    os = TaskOS.LINUX
+    capabilities = SimpleNamespace(mounted=True)
+
+    def __init__(self, *, no_proxy: str, no_proxy_upper: str = "") -> None:
+        self._values = (no_proxy, no_proxy_upper)
+        self.exec_calls: list[dict[str, object]] = []
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        del cwd, timeout_sec, user
+        self.exec_calls.append({"command": command, "env": env})
+        if "printf" in command and "no_proxy" in command:
+            # Emulate the container echoing its injected values, in probe order.
+            return ExecResult(
+                return_code=0,
+                stdout=f"{self._values[0]}\n{self._values[1]}\n",
+                stderr="",
+            )
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+
+def _sanitize_harbor(tmp_path: Path) -> Harbor:
+    return Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+
+
+def test_sanitize_no_proxy_pins_cleaned_override_and_it_flows_into_execs(
+    tmp_path: Path,
+) -> None:
+    harbor = _sanitize_harbor(tmp_path)
+    raw = _NoProxyProbeEnvironment(no_proxy="localhost,::1,10.0.0.0/8")
+    capped = _ResourceCappedEnvironment(raw, {"TOKENIZERS_PARALLELISM": "false"})
+
+    asyncio.run(harbor._sanitize_no_proxy(capped))
+
+    # The lowercase value carried IPv6 -> a cleaned override is pinned; the empty
+    # uppercase value is left untouched (no spurious key).
+    assert capped.resource_env["no_proxy"] == "localhost,10.0.0.0/8"
+    assert "NO_PROXY" not in capped.resource_env
+
+    # The override now rides on every later exec, overriding the container's env.
+    asyncio.run(capped.exec(command="python -c pass"))
+    assert raw.exec_calls[-1]["env"]["no_proxy"] == "localhost,10.0.0.0/8"
+
+
+def test_sanitize_no_proxy_is_noop_without_ipv6(tmp_path: Path) -> None:
+    harbor = _sanitize_harbor(tmp_path)
+    raw = _NoProxyProbeEnvironment(no_proxy="localhost,127.0.0.1")
+    capped = _ResourceCappedEnvironment(raw, {})
+
+    asyncio.run(harbor._sanitize_no_proxy(capped))
+
+    assert "no_proxy" not in capped.resource_env
+    assert "NO_PROXY" not in capped.resource_env
 
 
 def test_harbor_close_uses_raw_environment_for_lifecycle_cleanup(
