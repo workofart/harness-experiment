@@ -15,12 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
-from src.adapters.chatgpt_codex import (
+from src.llm.codex import (
     CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
     CODEX_CREDENTIALS_EXPIRED_MESSAGE,
     ChatGptCodexCredentialsExpiredError,
 )
-from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH, HarborConfig
+from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH, HarborConfig
 from src.control import repo as control_repo
 from src.control.agent_backend import (
     AgentBackend,
@@ -51,7 +51,7 @@ from src.experiment.record import (
     write_json_atomic,
 )
 from src.experiment.runner import ExperimentRunner, baseline_matches_panel_specs
-from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
+from src.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 
 DEFAULT_SUPERVISOR_WORKTREE_PARENT = DEFAULT_SUPERVISOR_ROOT
 # The candidate may write harness_config.json, but only these proposal fields
@@ -64,9 +64,9 @@ SUPERVISOR_VISIBLE_TRACKED_PATHS = (
     "uv.lock",
     "src/__init__.py",
     "src/serialization.py",
-    "src/adapters/llm_base.py",
+    "src/llm/base.py",
     "src/experiment/trial.py",
-    "src/harness/contracts.py",
+    "src/contracts.py",
     "src/trace.py",
     "src/metrics.py",
     "tests/conftest.py",
@@ -290,7 +290,7 @@ def _load_runtime(
     harness_config = load_harness_config_for_repo(repo_root)
     api_key: str | None = None
     if harness_config.llm_provider_config.provider == "openrouter":
-        from src.adapters.open_router import load_openrouter_api_key
+        from src.llm.openrouter import load_openrouter_api_key
 
         api_key = load_openrouter_api_key(dotenv_path=repo_root.resolve() / ".env")
     return HarborConfig.from_toml(harbor_config_path), api_key

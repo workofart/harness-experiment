@@ -31,14 +31,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # behind first call to reset() / download path keeps `uv run exp` cold-start
 # fast and shaves cost from invocations that never reach those paths.
 
-from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
-from src.adapters.harbor_docker import (
+from src.retry import INFRA_RETRY_BUDGET, retry_transient
+from src.env.docker import (
     DockerCleanup,
     _MAX_VERIFIER_ENV_SESSION_ID_LEN,
     _compact_verifier_task_session_prefix,
     _safe_verifier_session_text,
 )
-from src.harness.contracts import EnvExecWorkload, RawState
+from src.contracts import EnvExecWorkload, RawState
 
 DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"

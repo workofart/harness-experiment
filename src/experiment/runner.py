@@ -20,8 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 from src.control import repo as control_repo
 from src.experiment.trial import run_task
-from src.harness.contracts import TaskResult
-from src.metrics import is_majority_decided
+from src.contracts import TaskResult, is_majority_decided
 
 from src.experiment.gate import (
     build_baseline_pool,
@@ -42,8 +41,8 @@ from src.experiment.record import (
 )
 
 if TYPE_CHECKING:
-    from src.adapters.env import HarborConfig
-    from src.harness.config import HarnessConfig, LlmProviderConfig, PanelConfig
+    from src.env.harbor import HarborConfig
+    from src.config import HarnessConfig, LlmProviderConfig, PanelConfig
 
 
 DEFAULT_TASK_DURATION_PRIORS_PATH = (
@@ -56,7 +55,7 @@ async def _prepare_task_dirs(
     trial_harbor_config: HarborConfig,
     task_names: Sequence[str],
 ) -> dict[str, Path]:
-    from src.adapters.env import TaskDirectoryResolver
+    from src.env.harbor import TaskDirectoryResolver
 
     return dict(
         await TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names))
@@ -578,11 +577,11 @@ def _make_llm_for_config(*, config: LlmProviderConfig, api_key: str | None):
         case "openrouter":
             if api_key is None:
                 raise ValueError("OPENROUTER_API_KEY is not set")
-            from src.adapters.open_router import OpenRouter
+            from src.llm.openrouter import OpenRouter
 
             return OpenRouter(config=config, api_key=api_key)
         case "chatgpt_codex":
-            from src.adapters.chatgpt_codex import ChatGptCodex
+            from src.llm.codex import ChatGptCodex
 
             return ChatGptCodex(config=config)
 
@@ -674,7 +673,7 @@ class ExperimentRunner:
         record.write(root=experiments_root)
 
         try:
-            from src.adapters.env import Harbor
+            from src.env.harbor import Harbor
 
             trial_harbor_config = harbor_config.model_copy(
                 update={"experiments_dir": experiment_dir / "tasks"}
@@ -790,7 +789,7 @@ class ExperimentRunner:
         task_dir: Path,
         exec_semaphore: asyncio.Semaphore | None = None,
     ):
-        from src.adapters.env import Harbor
+        from src.env.harbor import Harbor
 
         return Harbor(
             self._trial_harbor_config(),

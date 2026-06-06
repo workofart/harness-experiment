@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from src.adapters.llm_base import LlmToolCall
-from src.harness.contracts import RawState
+from src.llm.base import LlmToolCall
+from src.contracts import RawState
 from src.harness.core import (
     ACTION_SPECS,
     DEFAULT_READ_WINDOW_LINES,

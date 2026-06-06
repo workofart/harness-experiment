@@ -18,7 +18,7 @@ from src.experiment.record import (
     task_success_summary,
     terminal_task_result,
 )
-from src.harness.contracts import TaskResult
+from src.contracts import TaskResult
 
 from conftest import _task_result, _write_task_artifacts
 

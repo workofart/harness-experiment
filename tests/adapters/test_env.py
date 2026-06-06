@@ -15,8 +15,8 @@ from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
-from src.adapters.harbor_docker import DockerCleanup
-from src.adapters.env import (
+from src.env.docker import DockerCleanup
+from src.env.harbor import (
     Harbor,
     HarborConfig,
     TaskDirectoryResolver,
@@ -1226,7 +1226,7 @@ def test_bootstrap_timeout_exhausts_budget_and_marks_status(
     # A persistent bootstrap timeout exhausts the within-trial budget and
     # re-raises; the only debuggable artifact (Harbor discards partial output on
     # timeout) is a status.txt marker recording the exhausted timeout.
-    from src.adapters.infra_retry import INFRA_RETRY_BUDGET
+    from src.retry import INFRA_RETRY_BUDGET
 
     monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     harbor = _stub_harbor_for_bootstrap(

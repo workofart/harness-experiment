@@ -22,9 +22,9 @@ This module defines the loop-local design:
   `TaskLoopState`
 
 Boundary contracts:
-- Environment adapters implement `src.harness.contracts.HarnessEnv`.
-- LLM adapters implement `src.adapters.llm_base.BaseLlm`.
-- Trial results cross back to the runner as `src.harness.contracts.TaskResult`.
+- Environment adapters implement `src.contracts.HarnessEnv`.
+- LLM adapters implement `src.llm.base.BaseLlm`.
+- Trial results cross back to the runner as `src.contracts.TaskResult`.
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ from abc import ABC
 from dataclasses import MISSING, asdict, dataclass, fields
 from typing import Any, ClassVar, Literal, TypeAlias, get_args, get_type_hints
 
-from src.adapters.llm_base import BaseLlm
-from src.harness.contracts import EnvExecWorkload, HarnessEnv, RawState
+from src.llm.base import BaseLlm
+from src.contracts import EnvExecWorkload, HarnessEnv, RawState
 from src.trace import (
     NOOP_HARNESS_RECORDER,
     NOOP_STEP_RECORDER,

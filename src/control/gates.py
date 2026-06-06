@@ -15,7 +15,7 @@ from pathlib import Path
 
 from src.control import repo as control_repo
 from src.experiment.gate import load_recent_candidate_records
-from src.harness.config import HarnessConfig
+from src.config import HarnessConfig
 
 
 SUPERVISOR_EDITABLE_PATHS = (

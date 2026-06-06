@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from src.experiment.trial import run_task
-from src.harness.contracts import RawState
+from src.contracts import RawState
 
 from conftest import _StubLlm, _StubEnv, _tool_call, _completion
 
@@ -147,7 +147,7 @@ def test_run_task_propagates_credentials_expired_instead_of_recording_crash():
     # containment (it inherits BaseException) so it bubbles up to halt the loop
     # rather than being recorded as a crashed trial the gate would discard. The
     # finally-block cleanup (slot release + resource close) must still run.
-    from src.adapters.chatgpt_codex import ChatGptCodexCredentialsExpiredError
+    from src.llm.codex import ChatGptCodexCredentialsExpiredError
 
     class _DeadCredentialsLlm(_StubLlm):
         async def complete(self, *, messages, tools=None, reasoning_effort=None):

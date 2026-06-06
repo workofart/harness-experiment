@@ -13,7 +13,7 @@ from src.experiment.record import (
     PanelRecord,
     terminal_task_result,
 )
-from src.harness.contracts import TaskResult
+from src.contracts import TaskResult
 
 
 def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):

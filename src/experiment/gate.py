@@ -19,13 +19,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
 
+from src.contracts import is_majority_solved
 from src.metrics import (
     AGGREGATE_PROMOTION_P_VALUE_ALPHA,
     PER_TASK_VERDICT_P_VALUE_ALPHA,
     BaselineComparison,
     compare_candidate_against_baseline,
     compute_fisher_exact_p_value,
-    is_majority_solved,
 )
 
 from src.experiment.record import ExperimentRecord, PanelDecision, PanelPurpose

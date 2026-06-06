@@ -4,11 +4,11 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH
+from src.config import DEFAULT_HARNESS_CONFIG_PATH
 
 if TYPE_CHECKING:
-    from src.adapters.env import HarborConfig
-    from src.harness.config import HarnessConfig
+    from src.env.harbor import HarborConfig
+    from src.config import HarnessConfig
 
 
 def load_strict_runtime_config(
@@ -16,8 +16,8 @@ def load_strict_runtime_config(
     harbor_config_path: Path,
     harness_config_path: Path,
 ) -> tuple[HarborConfig, HarnessConfig]:
-    from src.adapters.env import HarborConfig
-    from src.harness.config import HarnessConfig
+    from src.env.harbor import HarborConfig
+    from src.config import HarnessConfig
 
     harbor_config = HarborConfig.from_toml(harbor_config_path)
     harness_config = HarnessConfig.model_validate_json(harness_config_path.read_text())
@@ -30,14 +30,14 @@ def _load_llm_provider_secret(
     dotenv_path: str | Path = ".env",
 ) -> str | None:
     if harness_config.llm_provider_config.provider == "openrouter":
-        from src.adapters.open_router import load_openrouter_api_key
+        from src.llm.openrouter import load_openrouter_api_key
 
         return load_openrouter_api_key(dotenv_path=dotenv_path)
     return None
 
 
 def load_runtime_config() -> tuple[HarborConfig, HarnessConfig, str | None]:
-    from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH
+    from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
 
     harbor_config, harness_config = load_strict_runtime_config(
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
@@ -68,11 +68,11 @@ def _panel_task_summary(harness_config: HarnessConfig) -> str:
 def main_exp() -> int:
     import sys
 
-    from src.adapters.chatgpt_codex import (
+    from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         ChatGptCodexCredentialsExpiredError,
     )
-    from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH
+    from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.experiment.runner import ExperimentRunner
 
     harbor_config, harness_config, api_key = load_runtime_config()
@@ -98,7 +98,7 @@ def main_exp() -> int:
 def main_auto() -> int:
     import sys
 
-    from src.adapters.chatgpt_codex import (
+    from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         ChatGptCodexCredentialsExpiredError,
     )

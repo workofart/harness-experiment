@@ -136,7 +136,7 @@ def test_main_auto_returns_130_on_keyboard_interrupt(monkeypatch):
 
 
 def test_main_exp_returns_credentials_expired_code_when_token_dead(monkeypatch, capsys):
-    from src.adapters.chatgpt_codex import (
+    from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         CODEX_CREDENTIALS_EXPIRED_MESSAGE,
         ChatGptCodexCredentialsExpiredError,
@@ -175,7 +175,7 @@ def test_main_exp_returns_credentials_expired_code_when_token_dead(monkeypatch, 
 
 
 def test_main_auto_halts_on_credentials_expired(monkeypatch, capsys):
-    from src.adapters.chatgpt_codex import (
+    from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         CODEX_CREDENTIALS_EXPIRED_MESSAGE,
         ChatGptCodexCredentialsExpiredError,

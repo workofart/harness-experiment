@@ -18,8 +18,7 @@ from src.experiment.record import (
     TaskTrials,
     failed_experiment_git_ref,
 )
-from src.harness.contracts import TaskResult
-from src.metrics import TaskMetrics
+from src.contracts import TaskMetrics, TaskResult
 
 from conftest import _task_result
 
@@ -277,7 +276,7 @@ def _panel_trial_result(
 
 
 def test_make_llm_for_config_builds_chatgpt_adapter(monkeypatch):
-    fake_chatgpt_module = types.ModuleType("src.adapters.chatgpt_codex")
+    fake_chatgpt_module = types.ModuleType("src.llm.codex")
     calls: dict[str, object] = {}
 
     class FakeChatGptCodex:
@@ -285,7 +284,7 @@ def test_make_llm_for_config_builds_chatgpt_adapter(monkeypatch):
             calls["config"] = config
 
     fake_chatgpt_module.ChatGptCodex = FakeChatGptCodex
-    monkeypatch.setitem(sys.modules, "src.adapters.chatgpt_codex", fake_chatgpt_module)
+    monkeypatch.setitem(sys.modules, "src.llm.codex", fake_chatgpt_module)
     config = types.SimpleNamespace(provider="chatgpt_codex")
 
     llm = runner._make_llm_for_config(config=config, api_key=None)
@@ -300,7 +299,7 @@ class _FakeHarborConfig(SimpleNamespace):
 
 
 def _stub_baseline_task_environment(monkeypatch, tmp_path: Path) -> None:
-    from src.adapters import env as adapter_env
+    from src.env import harbor as adapter_env
 
     class FakeTaskDirectoryResolver:
         def __init__(self, config):

@@ -12,8 +12,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from src.adapters.llm_base import BaseLlm, LlmCompletion, LlmToolCall
-from src.harness.contracts import RawState, TaskResult
+from src.llm.base import BaseLlm, LlmCompletion, LlmToolCall
+from src.contracts import RawState, TaskResult
 
 
 class _StubLlm(BaseLlm):

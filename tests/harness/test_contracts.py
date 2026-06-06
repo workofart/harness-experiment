@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from src.harness.contracts import TaskResult
-from src.metrics import TaskMetrics
+from src.contracts import TaskMetrics, TaskResult
 
 
 def test_task_result_from_dict_loads_metric_fields():

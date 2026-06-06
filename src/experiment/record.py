@@ -20,8 +20,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from src.harness.contracts import TaskResult
-from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
+from src.contracts import FailureMode, TaskMetrics, TaskResult, is_majority_solved
+from src.metrics import BaselineComparison
 
 
 EXPERIMENT_FILENAME = "experiment.json"

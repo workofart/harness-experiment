@@ -7,9 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.adapters.llm_base import LlmCompletion
-from src.harness.contracts import RawState
-from src.metrics import FailureMode, TaskMetrics
+from src.llm.base import LlmCompletion
+from src.contracts import FailureMode, RawState, TaskMetrics
 from src.serialization import json_safe
 
 STEP_TRACE_FILENAME = "steps.jsonl"

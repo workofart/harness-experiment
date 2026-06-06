@@ -25,8 +25,8 @@ from src.experiment.record import (
     PanelRecord,
     TaskOutcomeEvidence,
 )
-from src.harness.config import HarnessConfig, OpenRouterConfig
-from src.harness.contracts import TaskResult
+from src.config import HarnessConfig, OpenRouterConfig
+from src.contracts import TaskResult
 
 from conftest import _write_task_artifacts
 
@@ -482,7 +482,7 @@ def test_launch_tracked_experiment_halts_on_credentials_expired_exit_code(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from src.adapters.chatgpt_codex import (
+    from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         ChatGptCodexCredentialsExpiredError,
     )
@@ -530,7 +530,7 @@ def make_sparse_repo(tmp_path: Path) -> Path:
     repo_root = tmp_path / "repo"
     (repo_root / "config").mkdir(parents=True)
     (repo_root / "src" / "harness").mkdir(parents=True)
-    (repo_root / "src" / "adapters").mkdir(parents=True)
+    (repo_root / "src" / "llm").mkdir(parents=True)
     (repo_root / "tests" / "harness").mkdir(parents=True)
     (repo_root / "src" / "__init__.py").write_text("")
     (repo_root / "src" / "serialization.py").write_text(
@@ -542,9 +542,9 @@ def make_sparse_repo(tmp_path: Path) -> Path:
     (repo_root / "config" / "harness_config.json").write_text(
         '{"experiment_id":"exp"}\n'
     )
-    (repo_root / "src" / "harness" / "contracts.py").write_text("class RawState: ...\n")
+    (repo_root / "src" / "contracts.py").write_text("class RawState: ...\n")
     (repo_root / "src" / "harness" / "core.py").write_text("CORE = 1\n")
-    (repo_root / "src" / "adapters" / "llm_base.py").write_text("class BaseLlm: ...\n")
+    (repo_root / "src" / "llm" / "base.py").write_text("class BaseLlm: ...\n")
     (repo_root / "src" / "experiment").mkdir(parents=True)
     (repo_root / "src" / "experiment" / "trial.py").write_text("TRIAL = 1\n")
     (repo_root / "src" / "trace.py").write_text("STEP_TRACE_FILENAME='steps.jsonl'\n")
@@ -599,7 +599,7 @@ def test_ensure_sparse_workspace_keeps_only_visible_paths_and_experiments(
 
     assert (workspace_root / "program.md").exists()
     assert (workspace_root / "config" / "harness_config.json").exists()
-    assert (workspace_root / "src" / "harness" / "contracts.py").exists()
+    assert (workspace_root / "src" / "contracts.py").exists()
     assert (workspace_root / "src" / "harness" / "core.py").exists()
     assert (workspace_root / "src" / "serialization.py").exists()
     assert (workspace_root / "src" / "experiment" / "trial.py").exists()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
+from src.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 
 
 def promotion_panel(

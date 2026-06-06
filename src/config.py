@@ -6,7 +6,7 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_HARNESS_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2] / "config" / "harness_config.json"
+    Path(__file__).resolve().parents[1] / "config" / "harness_config.json"
 )
 ReasoningEffort = Literal["none", "low", "medium", "high"]
 OpenRouterServiceTier = Literal["auto", "default", "flex"]

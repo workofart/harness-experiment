@@ -5,15 +5,14 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 import src.trace as trace_module
-from src.adapters.llm_base import BaseLlm
+from src.llm.base import BaseLlm
 from src.experiment.record import existing_artifact_path
-from src.harness.contracts import HarnessEnv, TaskResult
+from src.contracts import FailureMode, HarnessEnv, TaskResult
 from src.harness.core import (
     NoValidActionError,
     TaskLoopState,
     run_task_loop,
 )
-from src.metrics import FailureMode
 
 
 def _failure_mode(

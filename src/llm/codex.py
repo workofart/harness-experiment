@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
-from src.adapters.llm_base import (
+from src.retry import INFRA_RETRY_BUDGET, retry_transient
+from src.llm.base import (
     BaseLlm,
     LlmCompletion,
     LlmToolCall,
@@ -24,7 +24,7 @@ from src.adapters.llm_base import (
 )
 
 if TYPE_CHECKING:
-    from src.harness.config import ChatGptCodexConfig
+    from src.config import ChatGptCodexConfig
 
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
