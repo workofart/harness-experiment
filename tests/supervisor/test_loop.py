@@ -53,39 +53,15 @@ _KEEP = Decision(kind="keep", reason="kept", verdicts={})
 _DISCARD = Decision(kind="discard", reason="discarded", verdicts={})
 
 
-def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+# repo_root + experiments_dir fixtures are shared via tests/supervisor/conftest.py.
 
 
-@pytest.fixture
-def repo_root(tmp_path: Path) -> Path:
-    root = tmp_path / "primary"
-    root.mkdir()
-    _git("init", "-q", "-b", "main", cwd=root)
-    _git("config", "user.email", "t@example.com", cwd=root)
-    _git("config", "user.name", "tester", cwd=root)
-    _git("config", "commit.gpgsign", "false", cwd=root)
-    (root / "src" / "harness").mkdir(parents=True)
-    (root / "tests" / "harness").mkdir(parents=True)
-    (root / "src" / "harness" / "core.py").write_text("VALUE = 1\n")
-    (root / "tests" / "harness" / "test_core.py").write_text(
-        "def test_ok():\n    assert True\n"
+def _config(train, test, *, task_trials: int = 3) -> SimpleNamespace:
+    return SimpleNamespace(
+        train_tasks=frozenset(train),
+        test_tasks=frozenset(test),
+        task_trials=task_trials,
     )
-    (root / "program.md").write_text("# program\n")
-    _git("add", "-A", cwd=root)
-    _git("commit", "-q", "-m", "init", cwd=root)
-    return root
-
-
-@pytest.fixture
-def experiments_dir(tmp_path: Path) -> Path:
-    # Outside the git repo, so seeding files never makes repo_root dirty (in
-    # production experiments/ is gitignored; here we sidestep gitignore entirely).
-    return tmp_path / "experiments"
-
-
-def _config(train, test) -> SimpleNamespace:
-    return SimpleNamespace(train_tasks=frozenset(train), test_tasks=frozenset(test))
 
 
 def _seed(
@@ -594,11 +570,15 @@ class _FakeExp:
 
     def __init__(self, *, run_status: str = "completed", solved: bool = False) -> None:
         self.calls: list[tuple[str, frozenset[str], Path]] = []
+        self.budgets: list[dict[str, int]] = []
         self._run_status = run_status
         self._solved = solved
 
-    def __call__(self, *, worktree, experiment_id, task_ids, experiments_dir):
+    def __call__(
+        self, *, worktree, experiment_id, task_ids, experiments_dir, trial_budget
+    ):
         self.calls.append((experiment_id, frozenset(task_ids), Path(worktree)))
+        self.budgets.append(dict(trial_budget))
         commit = loop_mod.repo.get_head_commit(cwd=worktree)
         path = ExperimentResult.path(experiment_id, root=experiments_dir)
         solved_by_task = {t: self._solved for t in task_ids}
@@ -736,6 +716,8 @@ def test_refresh_baseline_prewrites_loop_and_runs_all_configured(
     exp_id, task_ids, worktree = fake.calls[0]
     assert exp_id == "exp-base" and task_ids == frozenset({"a", "b"})
     assert worktree == repo_root  # baseline runs unmodified HEAD in the primary
+    # no baseline to derive from -> uniform-full on every task (§9 #7).
+    assert fake.budgets[0] == {"a": 3, "b": 3}
 
 
 def test_conclude_baseline_writes_a_keep_decision(
@@ -914,6 +896,38 @@ def test_propose_and_launch_commits_refs_prewrites_and_runs_train(
     assert worktree != repo_root
 
 
+def test_propose_and_launch_budgets_train_from_the_baseline(
+    repo_root: Path, experiments_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The per-task train budget crosses the run_exp seam: a train task the baseline
+    # solved on every trial starts at 1 confirming trial; an unsolved one at full
+    # (budget_from_baseline, §9 #7). This is the consume side of EXP_TRIAL_BUDGET.
+    _green_test_core(monkeypatch)
+
+    def edit_and_focus(worktree: Path) -> None:
+        (worktree / "src" / "harness" / "core.py").write_text("VALUE = 7  # mech\n")
+        (worktree / workspace.FOCUS_FILE).write_text("mech\n")
+
+    fake = _FakeExp()
+    ctx = _ctx(
+        repo_root,
+        experiments_dir,
+        train={"solved", "unsolved"},
+        test={"b"},
+        backend=_ScriptedBackend(edit_and_focus),
+        run_exp=fake,
+    )
+    head = loop_mod.repo.get_head_commit(cwd=repo_root)
+    base = _result(
+        "exp-base",
+        commit=head,
+        solved_by_task={"solved": True, "unsolved": False},
+    )
+    world = _blank_world(train={"solved", "unsolved"}, test={"b"}, active_baseline=base)
+    execute(ProposeAndLaunch(), world, ctx)
+    assert fake.budgets[0] == {"solved": 1, "unsolved": 3}
+
+
 def test_run_veto_runs_the_test_panel_at_the_candidate_ref(
     repo_root: Path, experiments_dir: Path
 ) -> None:
@@ -926,6 +940,40 @@ def test_run_veto_runs_the_test_panel_at_the_candidate_ref(
     exp_id, task_ids, worktree = fake.calls[0]
     assert exp_id == "exp-cand" and task_ids == frozenset({"b"})  # TEST panel only
     assert worktree != repo_root
+
+
+def test_run_exp_serializes_the_trial_budget_to_the_env(
+    repo_root: Path, experiments_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real _run_exp (not the fake) hands the per-task budget across the
+    # subprocess boundary as the EXP_TRIAL_BUDGET JSON map, beside EXP_TASK_IDS /
+    # EXP_EXPERIMENT_ID / EXP_EXPERIMENTS_DIR. cli._selected_trial_budget reads it.
+    import json
+
+    captured: dict[str, str] = {}
+
+    def fake_tty(args, *, cwd, env):
+        captured.update(env)
+        # the orchestrator would write the record; stub it so the existence check passes
+        write_experiment_result(
+            _result("exp-x", commit="c0", solved_by_task={"a": True}),
+            root=experiments_dir,
+        )
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(loop_mod, "_run_with_live_tty_output", fake_tty)
+    loop_mod._run_exp(
+        worktree=repo_root,
+        experiment_id="exp-x",
+        task_ids=frozenset({"a", "b"}),
+        experiments_dir=experiments_dir,
+        trial_budget={"a": 1, "b": 3},
+    )
+    assert json.loads(captured["EXP_TRIAL_BUDGET"]) == {"a": 1, "b": 3}
+    assert captured["EXP_TASK_IDS"] == "a,b"
+    assert captured["EXP_EXPERIMENT_ID"] == "exp-x"
 
 
 # --- Diagnose ---------------------------------------------------------------

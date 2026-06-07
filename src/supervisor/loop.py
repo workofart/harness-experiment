@@ -23,6 +23,7 @@ runner.
 from __future__ import annotations
 
 import errno
+import json
 import locale
 import os
 import pty
@@ -30,7 +31,7 @@ import selectors
 import subprocess
 import sys
 import tty
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,7 @@ from src.supervisor.policy import (
     RefreshBaseline,
     RunVeto,
     World,
+    budget_from_baseline,
     combine,
     decide,
     gate,
@@ -341,8 +343,8 @@ def build_diagnosis_prompt(
 
 # --- the `uv run exp` subprocess seam (§7) ----------------------------------
 
-# (worktree, experiment_id, task_ids, experiments_dir) -> None; injectable so the
-# loop is testable without a real container run.
+# (worktree, experiment_id, task_ids, experiments_dir, trial_budget) -> None;
+# injectable so the loop is testable without a real container run.
 ExpRunner = Callable[..., None]
 
 
@@ -422,13 +424,18 @@ def _run_exp(
     experiment_id: str,
     task_ids: frozenset[str],
     experiments_dir: Path,
+    trial_budget: Mapping[str, int],
 ) -> None:
     """Launch ``uv run exp`` in ``worktree`` over ``task_ids``, appending into the
     one ``experiment_id`` dir under the absolute ``experiments_dir`` (§12 path
     anchoring -- ``EXP_EXPERIMENTS_DIR`` keeps a worktree run byte-equivalent to a
-    primary run). Raises ``ChatGptCodexCredentialsExpiredError`` on the dead-creds
-    halt (exit 42, needs ``codex login``), a ``RuntimeError`` on any other failure,
-    and a ``RuntimeError`` if the run produced no ``experiment.json``."""
+    primary run). ``trial_budget`` (the per-task ``budget_from_baseline`` count,
+    §9) crosses the subprocess boundary as the ``EXP_TRIAL_BUDGET`` JSON map so a
+    candidate train/veto run gets the deterministic-baseline single-trial shortcut;
+    ``cli`` honors it like ``EXP_EXPERIMENTS_DIR``. Raises
+    ``ChatGptCodexCredentialsExpiredError`` on the dead-creds halt (exit 42, needs
+    ``codex login``), a ``RuntimeError`` on any other failure, and a
+    ``RuntimeError`` if the run produced no ``experiment.json``."""
     from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         CODEX_CREDENTIALS_EXPIRED_MESSAGE,
@@ -440,6 +447,7 @@ def _run_exp(
         "EXP_EXPERIMENT_ID": experiment_id,
         "EXP_TASK_IDS": ",".join(sorted(task_ids)),
         "EXP_EXPERIMENTS_DIR": str(experiments_dir.resolve()),
+        "EXP_TRIAL_BUDGET": json.dumps(dict(trial_budget)),
     }
     completed = _run_with_live_tty_output(["uv", "run", "exp"], cwd=worktree, env=env)
     if completed.returncode == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE:
@@ -524,6 +532,10 @@ def _refresh_baseline(ctx: LoopContext) -> None:
         experiment_id=experiment_id,
         task_ids=configured,
         experiments_dir=ctx.experiments_dir,
+        # No baseline to derive from -> uniform-full on every configured task.
+        trial_budget=budget_from_baseline(
+            None, task_ids=configured, full=ctx.config.task_trials
+        ),
     )
 
 
@@ -567,6 +579,11 @@ def _propose_and_launch(world: World, ctx: LoopContext) -> None:
             experiment_id=experiment_id,
             task_ids=world.train_tasks,
             experiments_dir=ctx.experiments_dir,
+            # A train task the baseline solved deterministically starts at 1 trial
+            # (confirm-on-fail expands it); everything else at full (§9 #7).
+            trial_budget=budget_from_baseline(
+                baseline, task_ids=world.train_tasks, full=ctx.config.task_trials
+            ),
         )
 
 
@@ -582,6 +599,13 @@ def _run_veto(experiment_id: str, world: World, ctx: LoopContext) -> None:
             experiment_id=experiment_id,
             task_ids=world.test_tasks,
             experiments_dir=ctx.experiments_dir,
+            # Same baseline-derived budget for the veto panel: a test task the
+            # baseline solved deterministically starts at 1 trial (§9 #7).
+            trial_budget=budget_from_baseline(
+                world.active_baseline,
+                task_ids=world.test_tasks,
+                full=ctx.config.task_trials,
+            ),
         )
 
 

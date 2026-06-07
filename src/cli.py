@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,6 +102,25 @@ def _selected_experiment_id() -> str:
     return f"exp-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
 
+def _selected_trial_budget(*, task_ids, harness_config) -> dict[str, int]:
+    # `auto` sets `EXP_TRIAL_BUDGET` (a JSON task->count map from
+    # `budget_from_baseline`, §9) so a candidate run gets the deterministic-baseline
+    # single-trial shortcut across the subprocess seam; a standalone `uv run exp`
+    # leaves it unset -> uniform-full. The loop is the only writer, so a budget that
+    # does not cover the selected task set exactly is a bug -> fail fast (§12 strict
+    # interfaces) rather than silently mis-budget.
+    raw = os.getenv("EXP_TRIAL_BUDGET")
+    if raw is None or not raw.strip():
+        return {task_id: harness_config.task_trials for task_id in task_ids}
+    budget = json.loads(raw)
+    if set(budget) != set(task_ids):
+        raise ValueError(
+            f"EXP_TRIAL_BUDGET keys {sorted(budget)} != selected task ids "
+            f"{sorted(task_ids)}"
+        )
+    return {task_id: int(budget[task_id]) for task_id in task_ids}
+
+
 def _task_timeout_by_task(harness_config) -> dict[str, float]:
     # Each task carries its owning panel's wall budget; tasks are disjoint across
     # panels (config §12), so this is unambiguous for any selected subset.
@@ -185,18 +205,24 @@ async def run_experiment(
     task_ids,
     experiment_id,
     trial_runner,
+    budget=None,
 ):
-    """Run the selected `task_ids` at the uniform full budget into `experiment_id`
-    -> a raw `ExperimentResult` (plan.md §2). One `run_tasks` call per `uv run exp`
-    invocation; an existing `experiment_id` is appended to (auto's train-then-test
-    across two calls). No baseline, gate, decision, or git -- the loop's (Step 5)."""
+    """Run the selected `task_ids` into `experiment_id` -> a raw `ExperimentResult`
+    (plan.md §2). `budget` is the per-task trial count (the gate's
+    `budget_from_baseline` for an `auto` candidate, via `EXP_TRIAL_BUDGET`);
+    `None` defaults to uniform-full (a standalone `exp`/baseline). One `run_tasks`
+    call per `uv run exp` invocation; an existing `experiment_id` is appended to
+    (auto's train-then-test across two calls). No baseline, gate, decision, or
+    git -- the loop's."""
     from src.experiment.orchestrator import run_tasks
 
+    if budget is None:
+        budget = {task_id: harness_config.task_trials for task_id in task_ids}
     return await run_tasks(
         experiment_id=experiment_id,
         git_commit_hash=git_commit_hash,
         task_ids=task_ids,
-        budget={task_id: harness_config.task_trials for task_id in task_ids},
+        budget=budget,
         full_trial_count=harness_config.task_trials,
         max_trial_concurrency=harness_config.max_trial_concurrency,
         max_heavy_action_concurrency=harness_config.max_heavy_action_concurrency,
@@ -206,7 +232,14 @@ async def run_experiment(
 
 
 async def _run_exp_async(
-    *, harness_config, harbor_config, api_key, git_commit_hash, task_ids, experiment_id
+    *,
+    harness_config,
+    harbor_config,
+    api_key,
+    git_commit_hash,
+    task_ids,
+    experiment_id,
+    budget,
 ):
     trial_runner = await _build_trial_runner(
         harness_config=harness_config,
@@ -222,6 +255,7 @@ async def _run_exp_async(
         task_ids=task_ids,
         experiment_id=experiment_id,
         trial_runner=trial_runner,
+        budget=budget,
     )
 
 
@@ -239,6 +273,7 @@ def main_exp() -> int:
     harbor_config, harness_config, api_key = load_runtime_config()
     task_ids = _selected_task_ids(harness_config)
     experiment_id = _selected_experiment_id()
+    budget = _selected_trial_budget(task_ids=task_ids, harness_config=harness_config)
     print(f"experiment: {experiment_id}")
     print(f"tasks ({len(task_ids)}): {', '.join(task_ids)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
@@ -255,6 +290,7 @@ def main_exp() -> int:
                 git_commit_hash=git_commit_hash,
                 task_ids=task_ids,
                 experiment_id=experiment_id,
+                budget=budget,
             )
         )
     except ChatGptCodexCredentialsExpiredError as exc:
@@ -266,14 +302,16 @@ def main_exp() -> int:
 
 
 def main_auto() -> int:
+    import contextlib
     import sys
 
+    from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         ChatGptCodexCredentialsExpiredError,
     )
-    from src.supervisor.agent_backend import create_backend
-    from src.control.supervisor import run_supervisor_loop
+    from src.supervisor.agent_backend import create_backend, supervisor_root_for_repo
+    from src.supervisor.loop import LoopContext, run_auto
 
     agent_type = "codex"
     for i, arg in enumerate(sys.argv[1:], 1):
@@ -284,15 +322,35 @@ def main_auto() -> int:
             agent_type = arg.split("=", 1)[1]
             break
 
-    backend = create_backend(agent_type)
-    try:
-        run_supervisor_loop(
-            repo_root=Path(__file__).resolve().parents[1],
-            backend=backend,
+    repo_root = Path(__file__).resolve().parents[1]
+    # §12: experiments_dir must anchor to <main_repo>, but HarborConfig resolves a
+    # relative experiments_dir against cwd -- so load with cwd at repo_root, making
+    # `uv run auto` cwd-independent (an absolute config path is unaffected; cwd is
+    # restored on exit, and the loop's I/O all uses explicit paths, never cwd).
+    with contextlib.chdir(repo_root):
+        harbor_config, harness_config = load_strict_runtime_config(
+            harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
+            harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
         )
+    ctx = LoopContext(
+        repo_root=repo_root,
+        # HarborConfig resolves experiments_dir to absolute (§12 path anchoring); the
+        # loop hands it to every `uv run exp` via EXP_EXPERIMENTS_DIR. Throwaway
+        # candidate worktrees live in a sibling dir so they never dirty the primary.
+        experiments_dir=harbor_config.experiments_dir,
+        worktree_root=supervisor_root_for_repo(repo_root) / "worktrees",
+        config=harness_config,
+        backend=create_backend(agent_type),
+        program_md_path=repo_root / "program.md",
+    )
+    try:
+        halt = run_auto(ctx)
     except ChatGptCodexCredentialsExpiredError as exc:
         print(f"\nSupervisor halted. {exc}", file=sys.stderr)
         return CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
     except KeyboardInterrupt:
         return 130
+    # run_auto only returns at a Halt (needs a human, §6); a LoopCorruption
+    # propagates uncaught (an impossible control state -- not a normal transition).
+    print(f"\nSupervisor halted: {halt.reason}", file=sys.stderr)
     return 0
