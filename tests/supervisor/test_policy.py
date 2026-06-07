@@ -124,6 +124,26 @@ def test_fisher_rejects_degenerate_tables(kwargs: dict[str, int]) -> None:
         compute_fisher_exact_p_value(**kwargs)
 
 
+def test_fisher_perfect_separation_matches_hypergeometric() -> None:
+    # 4/4 vs 0/4 is the most extreme split for these margins: the two-sided p
+    # is the mass of the two tail tables, 2 / C(8, 4) = 2/70 ≈ 0.02857.
+    p_value = compute_fisher_exact_p_value(
+        candidate_solved=4, candidate_total=4, baseline_solved=0, baseline_total=4
+    )
+    assert p_value == pytest.approx(2 / 70, abs=1e-6)
+
+
+def test_fisher_small_high_rate_baseline_is_not_significant() -> None:
+    # The variance-lottery case: 1/4 candidate vs a 3/3 baseline. A one-sample
+    # binomial against rate 1.0 would call this p≈0; Fisher, conditioning on both
+    # margins, returns a large p so the small baseline is treated as the weak
+    # evidence it is.
+    p_value = compute_fisher_exact_p_value(
+        candidate_solved=1, candidate_total=4, baseline_solved=3, baseline_total=3
+    )
+    assert p_value > 0.05
+
+
 # --- compare_candidate_against_baseline -------------------------------------
 
 
@@ -162,10 +182,174 @@ def test_compare_significant_regression_and_improvement() -> None:
 
 
 def test_compare_rejects_inconsistent_counts() -> None:
+    # solved cannot exceed total in either arm.
     with pytest.raises(ValueError):
         compare_candidate_against_baseline(
             candidate_solved=4, candidate_total=3, baseline_solved=0, baseline_total=3
         )
+    with pytest.raises(ValueError):
+        compare_candidate_against_baseline(
+            candidate_solved=0, candidate_total=4, baseline_solved=10, baseline_total=9
+        )
+
+
+def test_compare_rejects_negative_and_out_of_range_alpha() -> None:
+    with pytest.raises(ValueError):
+        compare_candidate_against_baseline(
+            candidate_solved=-1, candidate_total=4, baseline_solved=0, baseline_total=0
+        )
+    for bad_alpha in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            compare_candidate_against_baseline(
+                candidate_solved=1,
+                candidate_total=4,
+                baseline_solved=1,
+                baseline_total=4,
+                alpha=bad_alpha,
+            )
+
+
+def test_compare_uncompared_when_both_arms_empty() -> None:
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=0, baseline_solved=0, baseline_total=0
+    )
+    assert verdict.kind == "uncompared"
+    assert verdict.p_value is None
+    assert verdict.candidate_rate is None
+    assert verdict.baseline_rate is None
+
+
+def test_compare_first_solve_ever_is_improvement() -> None:
+    # Smallest possible no-baseline frontier win: a single 1/1 solve.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=1, candidate_total=1, baseline_solved=0, baseline_total=0
+    )
+    assert verdict.kind == "improvement"
+
+
+def test_compare_small_high_rate_baseline_does_not_false_regress() -> None:
+    # Regression test for the variance-lottery bug. A below-majority candidate dip
+    # against a SMALL high-rate baseline must NOT count as a significant regression:
+    # a 3/3 baseline is weak evidence of a ~1.0 true rate, so the comparison has to
+    # account for baseline sampling uncertainty (two-sample Fisher), not treat the
+    # baseline rate as a known point.
+    for candidate_solved, candidate_total, baseline_solved, baseline_total in (
+        (1, 4, 3, 3),
+        (2, 5, 4, 4),
+        (0, 3, 3, 3),
+    ):
+        verdict = compare_candidate_against_baseline(
+            candidate_solved=candidate_solved,
+            candidate_total=candidate_total,
+            baseline_solved=baseline_solved,
+            baseline_total=baseline_total,
+        )
+        assert verdict.kind == "unchanged", (
+            candidate_solved,
+            candidate_total,
+            baseline_solved,
+            baseline_total,
+            verdict.kind,
+        )
+
+
+def test_compare_moderate_gap_small_sample_is_unchanged() -> None:
+    # 3/4 vs 3/9: the rate is higher but two-sample Fisher does not reach
+    # significance at these counts, so the verdict is "unchanged", not a noisy
+    # promotion.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=3, candidate_total=4, baseline_solved=3, baseline_total=9
+    )
+    assert verdict.kind == "unchanged"
+    assert verdict.p_value is not None and verdict.p_value > 0.05
+
+
+def test_compare_small_sample_clear_regression() -> None:
+    # Baseline 4/4, candidate 0/5: two-sided Fisher p ≈ 0.0079 < alpha, rate below.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=5, baseline_solved=4, baseline_total=4
+    )
+    assert verdict.kind == "regression"
+    assert verdict.p_value is not None and verdict.p_value < 0.05
+
+
+def test_compare_small_sample_clear_improvement() -> None:
+    # Baseline 1/6 (~17%), candidate 6/6: a large gap at enough trials for Fisher
+    # to reach significance (p ≈ 0.0152).
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=6, candidate_total=6, baseline_solved=1, baseline_total=6
+    )
+    assert verdict.kind == "improvement"
+    assert verdict.p_value is not None and verdict.p_value < 0.05
+
+
+def test_compare_alpha_boundary_just_below() -> None:
+    # 0/4 vs 4/4: two-sided Fisher p ≈ 0.0286 < 0.05 -> regression.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=4, baseline_solved=4, baseline_total=4
+    )
+    assert verdict.p_value is not None and verdict.p_value < 0.05
+    assert verdict.kind == "regression"
+
+
+def test_compare_alpha_boundary_just_above() -> None:
+    # 0/3 vs 3/3: p ≈ 0.10 > 0.05 -- one fewer trial each side is no longer enough
+    # evidence, so the verdict stays "unchanged" (the n=3 boundary the gate leans on).
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=3, baseline_solved=3, baseline_total=3
+    )
+    assert verdict.p_value is not None and verdict.p_value > 0.05
+    assert verdict.kind == "unchanged"
+
+
+def test_compare_alpha_parameter_overrides_default() -> None:
+    # 0/4 vs 4/4 (p ≈ 0.0286) is a regression at the default alpha but a stricter
+    # alpha downgrades it to "unchanged"; p_value is independent of alpha.
+    default = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=4, baseline_solved=4, baseline_total=4
+    )
+    strict = compare_candidate_against_baseline(
+        candidate_solved=0,
+        candidate_total=4,
+        baseline_solved=4,
+        baseline_total=4,
+        alpha=0.01,
+    )
+    assert default.kind == "regression"
+    assert strict.kind == "unchanged"
+    assert default.p_value == strict.p_value
+
+
+def test_compare_zero_baseline_with_history_requires_majority() -> None:
+    # 9 baseline trials, none solved. A single candidate solve stays "unchanged"
+    # (no Fisher test runs -> p None); a majority-solve is an improvement.
+    not_majority = compare_candidate_against_baseline(
+        candidate_solved=1, candidate_total=5, baseline_solved=0, baseline_total=9
+    )
+    assert not_majority.kind == "unchanged"
+    assert not_majority.p_value is None
+    majority = compare_candidate_against_baseline(
+        candidate_solved=3, candidate_total=5, baseline_solved=0, baseline_total=9
+    )
+    assert majority.kind == "improvement"
+    assert majority.p_value is None
+
+
+def test_compare_zero_rate_on_both_sides_is_unchanged() -> None:
+    # 0/4 vs 0/5: zero-baseline branch fires, no candidate majority -> unchanged.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=4, baseline_solved=0, baseline_total=5
+    )
+    assert verdict.kind == "unchanged"
+    assert verdict.p_value is None
+
+
+def test_compare_zero_baseline_cannot_regress() -> None:
+    # Underperforming a 0%-rate baseline is impossible: "unchanged", never regression.
+    verdict = compare_candidate_against_baseline(
+        candidate_solved=0, candidate_total=8, baseline_solved=0, baseline_total=12
+    )
+    assert verdict.kind == "unchanged"
 
 
 # --- gate: promotion --------------------------------------------------------

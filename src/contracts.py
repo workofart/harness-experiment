@@ -5,14 +5,15 @@ environment must hand the harness on reset/exec/verify, and the lifecycle
 methods the harness can call. `TaskMetrics` is the mutable per-trial telemetry
 recorded by `trace.py` and persisted to `metrics.json`; `FailureMode` is its
 terminal-state bucket. `is_majority_solved`/`is_majority_decided` are the
-majority-vote predicates shared by the runner's early-stop and the gate. The
+majority-vote predicates shared by the orchestrator's early-stop and the gate. The
 trial *output* contract (one trial's result) lives in `experiment.record`
 (`TrialResult`), a layer up — `contracts` owns only the boundary + telemetry.
 
 Keeping these in one foundation module lets `src/harness/core.py` and
 `src/experiment/*` share a single source of truth without depending on each
 other (this is the merge of the former `harness/contracts.py` and the
-foundation half of `metrics.py`; the gate statistics stay in `metrics.py`).
+foundation half of the former `metrics.py`; the gate statistics now live in
+`supervisor/policy.py`).
 """
 
 from __future__ import annotations
