@@ -528,9 +528,12 @@ def validate_candidate(diff: CandidateDiff, *, task_ids: frozenset[str]) -> str 
 
 @dataclass(frozen=True, slots=True)
 class PendingRun:
-    """The <=1 run whose ``loop.decision`` is null (prewritten before its
-    orchestrator call). ``result is None`` => launch_incomplete (the loop.json
-    was committed but the experiment was never recorded)."""
+    """The <=1 *live* pending run: ``loop.decision`` is null (prewritten before
+    its orchestrator call) AND the run completed. ``scan()`` filters out dead
+    pendings -- crashed, killed mid-run, or launched-but-never-recorded
+    (``result is None``) -- so they never reach ``decide()`` and a prior crash
+    never blocks a manual rerun (§11); hence ``result`` is always a completed
+    ``ExperimentResult`` here."""
 
     loop: LoopResult
     result: ExperimentResult | None
@@ -586,18 +589,18 @@ Command = Halt | RefreshBaseline | ProposeAndLaunch | RunVeto | Conclude | Diagn
 def decide(w: World) -> Command:
     """The outer-loop truth table, executable (§6). First match wins; the order
     is the table. No stored phase -- every command is derived from ``World``.
-    HEAD-drift safety beyond rule 7's ``commit == HEAD`` lives at the one
-    HEAD-moving op (``Conclude``'s ``--ff-only``)."""
-    p = w.pending
-    if p and p.result and p.result.run_status in ("running", "crashed"):
-        return Halt(f"{p.loop.experiment_id} died mid-run ({p.result.run_status})")
+    A dead pending run (crashed, killed mid-run leaving run_status "running", or
+    launched-but-never-recorded) is filtered out of ``World.pending`` by ``scan()``
+    (§11), so the pending here is always a completed run a manual rerun can act on
+    -- a prior crash never blocks the loop. HEAD-drift safety beyond rule 6's
+    ``commit == HEAD`` lives at the one HEAD-moving op (``Conclude``'s
+    ``--ff-only``)."""
     if w.primary_dirty:
         return Halt("primary worktree dirty")
-    if p and p.result is None:
-        return Halt(f"{p.loop.experiment_id} launched but never recorded")
-    if p:  # a completed pending run
+    p = w.pending
+    if p:  # a completed pending run (scan() filtered out any dead pending)
         result = p.result
-        assert result is not None  # the launch_incomplete guard above ruled out None
+        assert result is not None and result.run_status == "completed"
         if p.loop.kind == "baseline":
             return Conclude(result.experiment_id)
         baseline = w.active_baseline

@@ -210,19 +210,125 @@ def test_scan_surfaces_a_pending_candidate_with_its_result(
     assert world.pending.result.run_status == "completed"
 
 
-def test_scan_pending_with_no_result_is_launch_incomplete(
+def test_scan_filters_a_launch_incomplete_pending(
     repo_root: Path, experiments_dir: Path
 ) -> None:
-    # loop.json prewritten, experiment.json never produced (the launch crashed
-    # before recording). scan surfaces it with result=None; decide() Halts.
+    # loop.json prewritten, experiment.json never produced (the launch died before
+    # recording). A dead pending (result is None) is filtered out of World.pending
+    # (§11) so a manual rerun proceeds instead of halting; the dir stays on disk.
     _seed(experiments_dir, "exp-cand", kind="candidate", decision=None, parent=None)
     world = scan(
         experiments_dir=experiments_dir,
         repo_root=repo_root,
         config=_config({"a"}, {"b"}),
     )
+    assert world.pending is None
+
+
+def test_scan_filters_a_crashed_pending(repo_root: Path, experiments_dir: Path) -> None:
+    # A run that crash-finalized (run_status "crashed") is a dead pending: filtered
+    # so a leftover crash never wedges a manual `uv run auto` (§11).
+    _seed(
+        experiments_dir,
+        "exp-cand",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="crashed",
+    )
+    world = scan(
+        experiments_dir=experiments_dir,
+        repo_root=repo_root,
+        config=_config({"a"}, {"b"}),
+    )
+    assert world.pending is None
+
+
+def test_scan_filters_a_dead_running_pending(
+    repo_root: Path, experiments_dir: Path
+) -> None:
+    # A process killed mid-run leaves run_status stuck at "running" (the crash
+    # handler never ran). On a fresh invocation the prior process is gone, so it is
+    # a dead pending -> filtered (§11).
+    _seed(
+        experiments_dir,
+        "exp-cand",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="running",
+    )
+    world = scan(
+        experiments_dir=experiments_dir,
+        repo_root=repo_root,
+        config=_config({"a"}, {"b"}),
+    )
+    assert world.pending is None
+
+
+def test_scan_filters_a_crashed_candidate_with_a_wrong_parent(
+    repo_root: Path, experiments_dir: Path
+) -> None:
+    # The pending-contract asserts (§12) guard a run we ACT on; a dead pending is
+    # only ignored, so its now-moot parent lineage is never checked -- it is
+    # filtered, not a corruption fault (contrast the completed-pending case below).
+    cfg = _config({"a"}, {"b"})
+    _seed(
+        experiments_dir,
+        "exp-base",
+        kind="baseline",
+        decision=_KEEP,
+        run_status="completed",
+        tasks=("a", "b"),
+    )
+    _seed(
+        experiments_dir,
+        "exp-cand",
+        kind="candidate",
+        decision=None,
+        parent="exp-stale",  # would raise LoopCorruption if this run were live
+        run_status="crashed",
+        tasks=("a",),
+    )
+    world = scan(experiments_dir=experiments_dir, repo_root=repo_root, config=cfg)
+    assert world.pending is None
+
+
+def test_scan_keeps_a_live_pending_beside_a_dead_one(
+    repo_root: Path, experiments_dir: Path
+) -> None:
+    # A leftover crashed pending must neither shadow a live completed one nor trip
+    # the >1-pending fault: the live pending is routed, the dead corpse ignored.
+    cfg = _config({"a"}, {"b"})
+    _seed(
+        experiments_dir,
+        "exp-base",
+        kind="baseline",
+        decision=_KEEP,
+        run_status="completed",
+        tasks=("a", "b"),
+    )
+    _seed(
+        experiments_dir,
+        "exp-dead",
+        kind="candidate",
+        decision=None,
+        parent="exp-base",
+        run_status="crashed",
+        tasks=("a",),
+    )
+    _seed(
+        experiments_dir,
+        "exp-live",
+        kind="candidate",
+        decision=None,
+        parent="exp-base",
+        run_status="completed",
+        tasks=("a",),
+    )
+    world = scan(experiments_dir=experiments_dir, repo_root=repo_root, config=cfg)
     assert world.pending is not None
-    assert world.pending.result is None
+    assert world.pending.loop.experiment_id == "exp-live"
 
 
 def test_scan_flags_an_undiagnosed_decided_candidate(
@@ -353,17 +459,63 @@ def test_scan_rejects_overlapping_panels(
         )
 
 
-def test_scan_rejects_more_than_one_pending(
+def test_scan_rejects_more_than_one_live_pending(
     repo_root: Path, experiments_dir: Path
 ) -> None:
-    _seed(experiments_dir, "exp-1", kind="candidate", decision=None, parent=None)
-    _seed(experiments_dir, "exp-2", kind="candidate", decision=None, parent=None)
-    with pytest.raises(LoopCorruption, match="more than one pending"):
+    # Two *completed* pendings the sequential loop never concluded is corruption.
+    _seed(
+        experiments_dir,
+        "exp-1",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="completed",
+        tasks=("a",),
+    )
+    _seed(
+        experiments_dir,
+        "exp-2",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="completed",
+        tasks=("a",),
+    )
+    with pytest.raises(LoopCorruption, match="more than one live pending"):
         scan(
             experiments_dir=experiments_dir,
             repo_root=repo_root,
             config=_config({"a"}, {"b"}),
         )
+
+
+def test_scan_tolerates_multiple_dead_pendings(
+    repo_root: Path, experiments_dir: Path
+) -> None:
+    # Stacked corpses (crashed twice without a rerun between) are all filtered, not
+    # a >1-pending fault -- a manual rerun still proceeds (§11).
+    _seed(
+        experiments_dir,
+        "exp-1",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="crashed",
+    )
+    _seed(
+        experiments_dir,
+        "exp-2",
+        kind="candidate",
+        decision=None,
+        parent=None,
+        run_status="crashed",
+    )
+    world = scan(
+        experiments_dir=experiments_dir,
+        repo_root=repo_root,
+        config=_config({"a"}, {"b"}),
+    )
+    assert world.pending is None
 
 
 def test_scan_rejects_a_pending_candidate_with_the_wrong_parent(
@@ -597,6 +749,11 @@ class _FakeExp:
             ),
             root=experiments_dir,
         )
+        if self._run_status == "crashed":
+            # The real orchestrator crash-finalizes the record AND the subprocess
+            # exits nonzero, so `_run_exp` raises (loop.py:457). Mirror both: the
+            # crashing process dies rather than the driver looping on the record.
+            raise RuntimeError(f"uv run exp crashed for {experiment_id}")
 
 
 def _ctx(
@@ -1016,11 +1173,14 @@ def test_execute_on_halt_is_a_programming_error(
 # --- run_auto driver --------------------------------------------------------
 
 
-def test_run_auto_returns_immediately_on_a_crashed_pending(
+def test_run_auto_relaunches_after_a_prior_crashed_pending(
     repo_root: Path, experiments_dir: Path
 ) -> None:
-    # A pending run that died mid-run is decide() rule 1 -> Halt; the driver returns
-    # it without executing anything (needs a human, §6).
+    # A leftover crashed pending from a dead prior process is filtered (§11): the
+    # driver does NOT halt on it -- it proceeds to a fresh RefreshBaseline. That
+    # relaunch here also crashes, so `_run_exp` raises (as the real subprocess would
+    # on a nonzero exit); the point is fake.calls == 1 with a fresh id, i.e. the loop
+    # launched rather than wedging on the old corpse.
     _seed(
         experiments_dir,
         "exp-cand",
@@ -1029,16 +1189,6 @@ def test_run_auto_returns_immediately_on_a_crashed_pending(
         parent=None,
         run_status="crashed",
     )
-    ctx = _ctx(repo_root, experiments_dir, train={"a"}, test={"b"})
-    halt = run_auto(ctx)
-    assert isinstance(halt, Halt) and "died mid-run" in halt.reason
-
-
-def test_run_auto_drives_refresh_baseline_then_halts_on_the_crash(
-    repo_root: Path, experiments_dir: Path
-) -> None:
-    # Empty -> RefreshBaseline; the run crash-finalizes -> next tick decide() Halts.
-    # Exercises the full scan -> decide -> execute -> scan -> Halt drive.
     fake = _FakeExp(run_status="crashed")
     ctx = _ctx(
         repo_root,
@@ -1048,9 +1198,30 @@ def test_run_auto_drives_refresh_baseline_then_halts_on_the_crash(
         run_exp=fake,
         experiment_id="exp-base",
     )
-    halt = run_auto(ctx)
-    assert len(fake.calls) == 1  # one RefreshBaseline launch, then it halted
-    assert isinstance(halt, Halt) and "died mid-run" in halt.reason
+    with pytest.raises(RuntimeError):
+        run_auto(ctx)
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0] == "exp-base"  # a fresh baseline, not the old corpse
+
+
+def test_run_auto_propagates_a_crash_during_a_run(
+    repo_root: Path, experiments_dir: Path
+) -> None:
+    # Empty -> RefreshBaseline; the run crash-finalizes and the subprocess exits
+    # nonzero, so `_run_exp` raises and run_auto propagates it (the crashing process
+    # dies; the user reruns -- §11). It must not loop on the crashed record.
+    fake = _FakeExp(run_status="crashed")
+    ctx = _ctx(
+        repo_root,
+        experiments_dir,
+        train={"a"},
+        test={"b"},
+        run_exp=fake,
+        experiment_id="exp-base",
+    )
+    with pytest.raises(RuntimeError):
+        run_auto(ctx)
+    assert len(fake.calls) == 1  # one RefreshBaseline launch, then it raised
 
 
 def _blank_world(

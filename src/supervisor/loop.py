@@ -197,11 +197,24 @@ def scan(*, experiments_dir: Path, repo_root: Path, config) -> World:
 
     autos = _load_auto_experiments(experiments_dir)
 
-    pendings = [a for a in autos if a.loop.decision is None]
-    if len(pendings) > 1:
+    # Only a *completed* pending is "live" and routed on; a dead pending (crashed,
+    # killed mid-run leaving run_status "running", or launched-but-never-recorded
+    # with result is None) is filtered out here so a manual `uv run auto` after a
+    # crash proceeds without interference (§11). A dead pending is never adopted
+    # (its decision is null, so not a keep) and its artifacts stay on disk for
+    # inspection. Only >1 *live* pending is corruption (two candidates the
+    # sequential loop never concluded); stacked dead corpses are tolerated.
+    live_pendings = [
+        a
+        for a in autos
+        if a.loop.decision is None
+        and a.result is not None
+        and a.result.run_status == "completed"
+    ]
+    if len(live_pendings) > 1:
         raise LoopCorruption(
-            "more than one pending run (§12): "
-            + ", ".join(a.loop.experiment_id for a in pendings)
+            "more than one live pending run (§12): "
+            + ", ".join(a.loop.experiment_id for a in live_pendings)
         )
 
     keeps = [
@@ -244,8 +257,8 @@ def scan(*, experiments_dir: Path, repo_root: Path, config) -> World:
     )
 
     pending_run: PendingRun | None = None
-    if pendings:
-        pending = pendings[0]
+    if live_pendings:
+        pending = live_pendings[0]
         _assert_pending_contract(
             pending, active_baseline, train=train, configured=configured
         )

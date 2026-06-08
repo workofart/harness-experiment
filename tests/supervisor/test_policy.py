@@ -631,27 +631,8 @@ def _world(**overrides: object) -> World:
     return World(**base)  # type: ignore[arg-type]
 
 
-def test_decide_halts_on_a_run_that_died_mid_run() -> None:
-    pending = PendingRun(loop=_loop(), result=_exp(run_status="crashed"))
-    command = decide(_world(pending=pending))
-    assert isinstance(command, Halt) and "died mid-run" in command.reason
-
-
 def test_decide_halts_on_dirty_primary_worktree() -> None:
     assert isinstance(decide(_world(primary_dirty=True)), Halt)
-
-
-def test_decide_running_takes_precedence_over_dirty() -> None:
-    # Rule 1 (mid-run death) fires before rule 2 (dirty) -- order matters.
-    pending = PendingRun(loop=_loop(), result=_exp(run_status="running"))
-    command = decide(_world(pending=pending, primary_dirty=True))
-    assert isinstance(command, Halt) and "died mid-run" in command.reason
-
-
-def test_decide_halts_on_launch_incomplete() -> None:
-    pending = PendingRun(loop=_loop(), result=None)
-    command = decide(_world(pending=pending))
-    assert isinstance(command, Halt) and "never recorded" in command.reason
 
 
 def test_decide_concludes_a_completed_baseline_run() -> None:
