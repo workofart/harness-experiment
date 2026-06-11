@@ -405,6 +405,7 @@ def build_system_prompt() -> str:
             "Return one or more tool calls. They execute in order with no intermediate observation, then the resulting state appears in the next turn.",
             "Batch calls only when later calls do not depend on earlier results; otherwise emit one call and wait for the observation.",
             "Use list_dir, find_files, search_text, and read_file before broad edits.",
+            "Each observation reports time_remaining, your remaining wall-clock budget in seconds (absent only when unbounded); pace your work and verify before it runs out.",
             "Call verify as soon as you believe the task is complete to confirm success and end the trial.",
         ]
     )
@@ -423,6 +424,11 @@ def build_initial_user_prompt(*, instruction: str, working_dir: str | None) -> s
 def render_tool_result(raw_state: RawState, *, char_limit: int) -> str:
     """Render one observation as the body of a `role:"tool"` message."""
     lines: list[str] = []
+    if raw_state.time_remaining_sec is not None:
+        # Surface the trial's remaining wall budget so the agent can pace itself
+        # and verify before the task timeout cuts it off. `None` means unbounded
+        # (no budget configured), so the line is simply omitted.
+        lines.append(f"time_remaining: {int(raw_state.time_remaining_sec)}s")
     if raw_state.return_code is not None:
         lines.append(f"rc={raw_state.return_code}")
     if raw_state.stdout:

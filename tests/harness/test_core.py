@@ -367,6 +367,19 @@ def test_render_tool_result_returns_no_output_when_state_is_empty():
     assert render_tool_result(RawState(), char_limit=100) == "(no output)"
 
 
+def test_render_tool_result_surfaces_time_remaining_budget():
+    # The stamped wall budget must reach the agent's observation, not just the
+    # trace: an integer-second `time_remaining` line, omitted when unbounded.
+    rendered = render_tool_result(
+        RawState(return_code=0, stdout="out", time_remaining_sec=42.7), char_limit=100
+    )
+    assert "time_remaining: 42s" in rendered
+    assert "rc=0" in rendered
+    assert "time_remaining" not in render_tool_result(
+        RawState(return_code=0, stdout="out"), char_limit=100
+    )
+
+
 def test_render_tool_result_truncates_long_output():
     long = "x" * 1000
     rendered = render_tool_result(RawState(return_code=0, stdout=long), char_limit=100)
