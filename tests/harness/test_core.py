@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from typing import Any
 
 import pytest
@@ -277,9 +278,42 @@ def test_execute_action_edit_file_uses_python_script():
     )
     cmd = env.exec_calls[0]["command"]
     assert cmd.startswith("python3 -c ")
-    assert "p.read_text().replace" in cmd
+    assert "text.replace" in cmd
     assert cmd.endswith(" /x foo BAR")
     assert env.exec_calls[0]["workload"] == "light"
+
+
+def _run_edit_command(action: EditFileAction) -> "subprocess.CompletedProcess[str]":
+    # Capture the exact shell command execute_action emits, then run it for real:
+    # the edit semantics live in the generated script, not the stub env.
+    env = _StubEnv()
+    asyncio.run(execute_action(env, action))
+    return subprocess.run(
+        env.exec_calls[0]["command"], shell=True, capture_output=True, text=True
+    )
+
+
+def test_edit_file_no_match_fails_loudly(tmp_path):
+    # Regression: a non-matching old_text used to rewrite the file unchanged with
+    # rc=0 and no output, so the model believed the edit landed.
+    target = tmp_path / "f.txt"
+    target.write_text("hello world\n")
+    completed = _run_edit_command(
+        EditFileAction(path=str(target), old_text="absent", new_text="X")
+    )
+    assert completed.returncode != 0
+    assert "old_text not found" in completed.stderr
+    assert target.read_text() == "hello world\n"
+
+
+def test_edit_file_match_replaces_first_occurrence(tmp_path):
+    target = tmp_path / "f.txt"
+    target.write_text("foo bar foo\n")
+    completed = _run_edit_command(
+        EditFileAction(path=str(target), old_text="foo", new_text="BAR")
+    )
+    assert completed.returncode == 0
+    assert target.read_text() == "BAR bar foo\n"
 
 
 def test_execute_action_run_passes_through_command_cwd_timeout():

@@ -364,10 +364,15 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
                 workload="light",
             )
         case EditFileAction(path=path, old_text=old_text, new_text=new_text):
+            # A non-matching old_text must fail loudly: rewriting the file
+            # unchanged with rc=0 reads as a landed edit to the model.
             script = (
                 "import sys, pathlib; "
                 "p = pathlib.Path(sys.argv[1]); "
-                "p.write_text(p.read_text().replace(sys.argv[2], sys.argv[3], 1))"
+                "text = p.read_text(); "
+                "sys.exit('old_text not found in ' + sys.argv[1]) "
+                "if sys.argv[2] not in text "
+                "else p.write_text(text.replace(sys.argv[2], sys.argv[3], 1))"
             )
             return await env.exec(
                 command=(
